@@ -1176,6 +1176,11 @@ def animate(_):
         rover_intersection_constraints = compute_intersection_constraints()
         intersections_dirty = False
 
+    rover_has_intersections = [False] * len(rover_states)
+    for i, j, _idx_i, _idx_j in rover_intersection_constraints:
+        rover_has_intersections[i] = True
+        rover_has_intersections[j] = True
+
     allowed_to_move = set(range(len(rover_states)))
     for i, j, idx_i, idx_j in rover_intersection_constraints:
         if not (rover_moving[j] and rover_plans[j]):
@@ -1189,7 +1194,7 @@ def animate(_):
         candidates = {}
         for i in range(len(rover_states)):
             if rover_moving[i] and rover_plans[i] is not None:
-                if (i in allowed_to_move) or not rover_intersections[i]:
+                if (i in allowed_to_move) or not rover_has_intersections[i]:
                     if rover_play_idx[i] < len(rover_plans[i]):
                         candidates[i] = rover_plans[i][rover_play_idx[i]]
 
