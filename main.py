@@ -1168,8 +1168,12 @@ def animate(_):
     global intersections_dirty, rover_intersection_constraints
 
     if playing:
-        for i in range(len(rover_states)):
-            if not rover_moving[i] and rover_plans[i] is None:
+        all_idle = all(
+            (not rover_moving[i]) and rover_plans[i] is None
+            for i in range(len(rover_states))
+        )
+        if all_idle:
+            for i in range(len(rover_states)):
                 plan_next_rover_path(i)
 
     if intersections_dirty:
