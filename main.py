@@ -634,8 +634,7 @@ rover_plans = []
 rover_play_idx = []
 rover_moving = []
 rover_goal_gates = []
-rover_intersection_max_idx = []
-rover_intersections = []
+rover_intersection_constraints = []
 playing = False
 intersections_dirty = True
 
@@ -892,7 +891,7 @@ def clear_rover_artists():
 def reset_rovers(count):
     global rover_current_gates, rover_last_gates, rover_docked, rover_states
     global rover_executed_xy, rover_plans, rover_play_idx, rover_moving, rover_goal_gates
-    global rover_intersection_max_idx, rover_intersections, playing, intersections_dirty
+    global rover_intersection_constraints, playing, intersections_dirty
 
     clear_rover_artists()
 
@@ -905,8 +904,7 @@ def reset_rovers(count):
     rover_play_idx = []
     rover_moving = []
     rover_goal_gates = []
-    rover_intersection_max_idx = []
-    rover_intersections = []
+    rover_intersection_constraints = []
 
     for i in range(count):
         gate_idx = i % NUM_GATES
@@ -919,8 +917,6 @@ def reset_rovers(count):
         rover_play_idx.append(0)
         rover_moving.append(False)
         rover_goal_gates.append(None)
-        rover_intersection_max_idx.append(-1)
-        rover_intersections.append(set())
 
         col = rover_colors[i % len(rover_colors)]
         rover_poly = Polygon(square_corners((0, 0), 0.0, S),
@@ -970,10 +966,9 @@ def pick_next_gate(rover_idx):
     distances.sort(key=lambda x: (-x[1], x[0]))
     return distances[0][0]
 
-def compute_intersections():
+def compute_intersection_constraints():
     n = len(rover_plans)
-    max_idx = [-1 for _ in range(n)]
-    adjacency = [set() for _ in range(n)]
+    constraints = []
     for i in range(n):
         path_i = rover_plans[i]
         if not path_i or len(path_i) < 2:
@@ -984,18 +979,25 @@ def compute_intersections():
             if not path_j or len(path_j) < 2:
                 continue
             segs_j = list(zip(path_j[:-1], path_j[1:]))
+            first_i = None
+            first_j = None
             for idx_i, (a, b) in enumerate(segs_i):
                 a_xy = (a[0], a[1])
                 b_xy = (b[0], b[1])
+                hit = False
                 for idx_j, (c, d) in enumerate(segs_j):
                     c_xy = (c[0], c[1])
                     d_xy = (d[0], d[1])
                     if seg_intersect(a_xy, b_xy, c_xy, d_xy):
-                        adjacency[i].add(j)
-                        adjacency[j].add(i)
-                        max_idx[i] = max(max_idx[i], idx_i + 1)
-                        max_idx[j] = max(max_idx[j], idx_j + 1)
-    return max_idx, adjacency
+                        first_i = idx_i + 1
+                        first_j = idx_j + 1
+                        hit = True
+                        break
+                if hit:
+                    break
+            if first_i is not None:
+                constraints.append((i, j, first_i, first_j))
+    return constraints
 
 def plan_next_rover_path(rover_idx):
     global intersections_dirty
@@ -1012,27 +1014,6 @@ def plan_next_rover_path(rover_idx):
     rover_plan_lines[rover_idx].set_data([p[0] for p in plan], [p[1] for p in plan])
     intersections_dirty = True
     return True
-
-def intersection_components(adjacency):
-    n = len(adjacency)
-    visited = set()
-    comps = []
-    for i in range(n):
-        if i in visited:
-            continue
-        stack = [i]
-        comp = []
-        while stack:
-            u = stack.pop()
-            if u in visited:
-                continue
-            visited.add(u)
-            comp.append(u)
-            for v in adjacency[u]:
-                if v not in visited:
-                    stack.append(v)
-        comps.append(comp)
-    return comps
 
 def states_too_close(state_a, state_b, min_dist=COLLISION_DISTANCE):
     ax, ay, _ = state_a
@@ -1184,7 +1165,7 @@ slider_rovers.on_changed(on_rover_slider)
 # ANIMATION
 # ============================================================
 def animate(_):
-    global intersections_dirty, rover_intersection_max_idx, rover_intersections
+    global intersections_dirty, rover_intersection_constraints
 
     if playing:
         for i in range(len(rover_states)):
@@ -1192,34 +1173,17 @@ def animate(_):
                 plan_next_rover_path(i)
 
     if intersections_dirty:
-        rover_intersection_max_idx, rover_intersections = compute_intersections()
+        rover_intersection_constraints = compute_intersection_constraints()
         intersections_dirty = False
 
     allowed_to_move = set(range(len(rover_states)))
-    if rover_intersections:
-        components = intersection_components(rover_intersections)
-        allowed_to_move = set()
-        for comp in components:
-            pending = [
-                i for i in comp
-                if rover_moving[i]
-                and rover_intersection_max_idx[i] >= 0
-                and rover_play_idx[i] <= rover_intersection_max_idx[i]
-            ]
-            if pending:
-                lead = min(pending)
-                for i in comp:
-                    if rover_intersection_max_idx[i] < 0:
-                        allowed_to_move.add(i)
-                        continue
-                    if i == lead:
-                        allowed_to_move.add(i)
-                        continue
-                    if rover_play_idx[i] < rover_intersection_max_idx[i]:
-                        allowed_to_move.add(i)
-            else:
-                for i in comp:
-                    allowed_to_move.add(i)
+    for i, j, idx_i, idx_j in rover_intersection_constraints:
+        if not (rover_moving[j] and rover_plans[j]):
+            continue
+        if rover_play_idx[j] > idx_j:
+            continue
+        if rover_moving[i] and rover_plans[i] and rover_play_idx[i] <= idx_i:
+            allowed_to_move.discard(j)
 
     for _k in range(PLAYBACK_SKIP):
         candidates = {}
