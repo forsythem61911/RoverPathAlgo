@@ -42,6 +42,9 @@ W_REVERSE = 0.05
 # Animation
 FRAME_MS = 20
 PLAYBACK_SKIP = 2
+COLLISION_BUFFER = 0.1 * S
+ROVER_RADIUS = (S * math.sqrt(2.0)) / 2.0
+COLLISION_DISTANCE = 2.0 * ROVER_RADIUS + COLLISION_BUFFER
 
 # Smoothing controls
 SMOOTH_ENABLED_DEFAULT = True
@@ -940,6 +943,11 @@ def reset_rovers(count):
 def pick_next_gate(rover_idx):
     cur = rover_current_gates[rover_idx]
     last = rover_last_gates[rover_idx]
+    reserved = {
+        rover_goal_gates[i]
+        for i in range(len(rover_goal_gates))
+        if rover_goal_gates[i] is not None and i != rover_idx
+    }
     occupied = {
         rover_current_gates[i]
         for i in range(len(rover_current_gates))
@@ -947,10 +955,13 @@ def pick_next_gate(rover_idx):
     }
     candidates = [
         i for i in range(NUM_GATES)
-        if i != cur and i != last and i not in occupied
+        if i != cur and i != last and i not in occupied and i not in reserved
     ]
     if not candidates:
-        candidates = [i for i in range(NUM_GATES) if i != cur and i not in occupied]
+        candidates = [
+            i for i in range(NUM_GATES)
+            if i != cur and i not in occupied and i not in reserved
+        ]
     if not candidates:
         return cur
 
@@ -1022,6 +1033,50 @@ def intersection_components(adjacency):
                     stack.append(v)
         comps.append(comp)
     return comps
+
+def states_too_close(state_a, state_b, min_dist=COLLISION_DISTANCE):
+    ax, ay, _ = state_a
+    bx, by, _ = state_b
+    return (ax - bx)**2 + (ay - by)**2 < min_dist**2
+
+def resolve_step_conflicts(candidates, current_states):
+    """
+    candidates: dict rover_idx -> next_state
+    current_states: list of rover states (x,y,th)
+    Returns set of rover indices allowed to advance this step.
+    """
+    if not candidates:
+        return set()
+
+    allowed = set(candidates.keys())
+    rover_list = sorted(candidates.keys())
+
+    # block moves that would collide with stationary or non-advancing rovers
+    for i in rover_list:
+        if i not in allowed:
+            continue
+        next_state = candidates[i]
+        for j, cur_state in enumerate(current_states):
+            if j == i:
+                continue
+            if j in candidates:
+                continue
+            if states_too_close(next_state, cur_state):
+                allowed.discard(i)
+                break
+
+    # resolve pairwise conflicts between advancing rovers by priority (lower index wins)
+    rover_list = sorted(list(allowed))
+    for idx, i in enumerate(rover_list):
+        if i not in allowed:
+            continue
+        for j in rover_list[idx+1:]:
+            if j not in allowed:
+                continue
+            if states_too_close(candidates[i], candidates[j]):
+                allowed.discard(j)
+
+    return allowed
 
 def redraw_world():
     xmin, xmax, ymin, ymax = WORLD_BOUNDS
@@ -1157,29 +1212,38 @@ def animate(_):
                 for i in comp:
                     allowed_to_move.add(i)
 
-    for i in range(len(rover_states)):
-        if rover_moving[i] and rover_plans[i] is not None:
-            if (i in allowed_to_move) or not rover_intersections[i]:
-                for _k in range(PLAYBACK_SKIP):
-                    if rover_play_idx[i] >= len(rover_plans[i]):
-                        break
-                    rover_states[i] = rover_plans[i][rover_play_idx[i]]
-                    rover_play_idx[i] += 1
-                rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
+    for _k in range(PLAYBACK_SKIP):
+        candidates = {}
+        for i in range(len(rover_states)):
+            if rover_moving[i] and rover_plans[i] is not None:
+                if (i in allowed_to_move) or not rover_intersections[i]:
+                    if rover_play_idx[i] < len(rover_plans[i]):
+                        candidates[i] = rover_plans[i][rover_play_idx[i]]
 
-                if rover_play_idx[i] >= len(rover_plans[i]):
-                    goal_gate = rover_goal_gates[i]
-                    rover_states[i] = (D_pts[goal_gate][0], D_pts[goal_gate][1], H_req[goal_gate])
-                    rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
-                    rover_last_gates[i] = rover_current_gates[i]
-                    rover_current_gates[i] = goal_gate
-                    rover_goal_gates[i] = None
-                    rover_plans[i] = None
-                    rover_play_idx[i] = 0
-                    rover_moving[i] = False
-                    rover_docked[i] = True
-                    rover_plan_lines[i].set_data([], [])
-                    intersections_dirty = True
+        allowed_step = resolve_step_conflicts(candidates, rover_states)
+
+        if not allowed_step:
+            break
+
+        for i in sorted(allowed_step):
+            rover_states[i] = candidates[i]
+            rover_play_idx[i] += 1
+            rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
+
+        for i in list(allowed_step):
+            if rover_play_idx[i] >= len(rover_plans[i]):
+                goal_gate = rover_goal_gates[i]
+                rover_states[i] = (D_pts[goal_gate][0], D_pts[goal_gate][1], H_req[goal_gate])
+                rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
+                rover_last_gates[i] = rover_current_gates[i]
+                rover_current_gates[i] = goal_gate
+                rover_goal_gates[i] = None
+                rover_plans[i] = None
+                rover_play_idx[i] = 0
+                rover_moving[i] = False
+                rover_docked[i] = True
+                rover_plan_lines[i].set_data([], [])
+                intersections_dirty = True
 
     for i in range(len(rover_states)):
         rover_artists[i].set_xy(square_corners((rover_states[i][0], rover_states[i][1]),
