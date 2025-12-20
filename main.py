@@ -2,6 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Button
 import math, random
 from dataclasses import dataclass
 import heapq
@@ -9,36 +10,43 @@ import heapq
 # ============================================================
 # CONFIG
 # ============================================================
-SEED = 7
+BASE_SEED = 7
 NUM_GATES = 5
 
-S = 1.0                 # rover side length
-DEPTH = 2.2 * S         # gate depth
-APPROACH_L = 1.35 * S   # standoff before docking
-MIN_GATE_SEP = 2.8 * S  # min separation between gate centers
+S = 1.0
+DEPTH = 2.2 * S
+APPROACH_L = 1.35 * S
+MIN_GATE_SEP = 2.8 * S
 
 WORLD_HALFSPAN = 9.0
-BOUND_MARGIN = 1.5 * S  # keep rover inside world boundary
+BOUND_MARGIN = 1.5 * S
 
-EPS = 2e-3              # touching allowed: shrink rover by 2*EPS in collision tests
+EPS = 2e-3
 
-# Lazy PRM settings
-PRM_SAMPLES = 900       # random free samples (approach nodes added separately)
-PRM_K = 20              # nearest neighbors per node
-TEMP_K = 28             # neighbors for temp start/goal nodes
-A_STAR_EXPANSION_LIMIT = 10000
+# Lazy PRM
+PRM_SAMPLES = 900
+PRM_K = 20
+TEMP_K = 28
+A_STAR_EXPANSION_LIMIT = 12000
 
-# Motion sampling resolution
+# Collision sampling
 POS_RES = 0.08
 TH_RES  = 0.12
 
 # Costs
 W_TURN = 0.18
-W_REVERSE = 0.05        # small penalty for reverse (set 0 if you don't care)
+W_REVERSE = 0.05
 
 # Animation
 FRAME_MS = 20
-PLAYBACK_SKIP = 3
+PLAYBACK_SKIP = 2
+
+# Smoothing controls
+SMOOTH_ENABLED_DEFAULT = True
+SHORTCUT_TRIES = 220          # higher => fewer turns (more checks)
+CHAIKIN_ITERS_MAX = 2         # 0,1,2...
+RESAMPLE_STEP = 0.06          # distance per playback step (controls speed)
+END_LOCK_TOL = 0.08           # tolerance for detecting approach in playback
 
 # ============================================================
 # BASIC MATH
@@ -101,7 +109,6 @@ def point_segment_distance_sq(p, a, b):
     return float(np.dot(d, d))
 
 def point_in_convex_quad(p, quad):
-    # boundary treated as outside (touching ok because we shrink rover)
     x, y = p
     s = None
     for i in range(4):
@@ -129,9 +136,8 @@ def square_intersects_segment(center, theta, side, s0, s1):
 def square_collides_walls(center, theta, side, walls, eps=EPS):
     side_eff = max(1e-6, side - 2.0*eps)
     c = np.array(center, dtype=float)
-    r = (side_eff / 2.0) * math.sqrt(2.0)  # circumradius
+    r = (side_eff / 2.0) * math.sqrt(2.0)
     r2 = r * r
-
     for (w0, w1) in walls:
         if point_segment_distance_sq(c, w0, w1) > r2:
             continue
@@ -218,26 +224,19 @@ def drive_straight_free(x0, y0, x1, y1, th, side, walls, bounds, margin, pos_res
     return True
 
 def se2_edge_free_with_reverse(a, b, side, walls, bounds, margin):
-    """
-    Edge primitive: rotate -> straight -> rotate.
-    Allows forward OR reverse driving (choose whichever is feasible).
-    """
     ax, ay, ath = a
     bx, by, bth = b
     dx, dy = bx - ax, by - ay
     dist2 = dx*dx + dy*dy
-
     if dist2 < 1e-12:
         return rotate_in_place_free(ax, ay, ath, bth, side, walls, bounds, margin), False
 
     travel = math.atan2(dy, dx)
 
-    # Option A: forward drive with heading = travel
     okA = (rotate_in_place_free(ax, ay, ath, travel, side, walls, bounds, margin) and
            drive_straight_free(ax, ay, bx, by, travel, side, walls, bounds, margin) and
            rotate_in_place_free(bx, by, travel, bth, side, walls, bounds, margin))
 
-    # Option B: reverse drive with heading = travel + pi
     travel_rev = wrap_angle(travel + np.pi)
     okB = (rotate_in_place_free(ax, ay, ath, travel_rev, side, walls, bounds, margin) and
            drive_straight_free(ax, ay, bx, by, travel_rev, side, walls, bounds, margin) and
@@ -255,11 +254,9 @@ def se2_edge_cost(a, b, used_reverse=False):
     dist = math.hypot(bx-ax, by-ay)
     if dist < 1e-12:
         return W_TURN * abs(wrap_angle(bth-ath))
-
     travel = math.atan2(by-ay, bx-ax)
     if used_reverse:
         travel = wrap_angle(travel + np.pi)
-
     turn = abs(wrap_angle(travel - ath)) + abs(wrap_angle(bth - travel))
     return dist + W_TURN * turn + (W_REVERSE if used_reverse else 0.0)
 
@@ -282,20 +279,17 @@ def densify_edge(a, b, used_reverse=False, ds=0.06, dth=0.12):
     if used_reverse:
         travel = wrap_angle(travel + np.pi)
 
-    # rotate start
     d0 = wrap_angle(travel - ath)
     n0 = max(1, int(abs(d0)/dth))
     for i in range(1, n0+1):
         t = i/n0
         out.append((ax, ay, wrap_angle(ath + t*d0)))
 
-    # straight
     n1 = max(1, int(dist/ds))
     for i in range(1, n1+1):
         t = i/n1
         out.append((ax + t*dx, ay + t*dy, travel))
 
-    # rotate end
     d2 = wrap_angle(bth - travel)
     n2 = max(1, int(abs(d2)/dth))
     for i in range(1, n2+1):
@@ -304,16 +298,28 @@ def densify_edge(a, b, used_reverse=False, ds=0.06, dth=0.12):
 
     return out
 
+def densify_straight_pose(a_xy, b_xy, th, ds=0.05):
+    ax, ay = a_xy
+    bx, by = b_xy
+    dx, dy = bx-ax, by-ay
+    dist = math.hypot(dx, dy)
+    n = max(1, int(dist/ds))
+    out = []
+    for i in range(n+1):
+        t = i/n
+        out.append((ax + t*dx, ay + t*dy, th))
+    return out
+
 # ============================================================
 # WORLD GENERATION (DOCKABLE)
 # ============================================================
-def generate_world(num_gates, seed=SEED):
+def generate_world(num_gates, seed):
     rng_np = np.random.default_rng(seed)
     bounds = (-WORLD_HALFSPAN, WORLD_HALFSPAN, -WORLD_HALFSPAN, WORLD_HALFSPAN)
 
     gates = []
     tries = 0
-    while len(gates) < num_gates and tries < 40000:
+    while len(gates) < num_gates and tries < 50000:
         tries += 1
         center = rng_np.uniform(-0.7*WORLD_HALFSPAN, 0.7*WORLD_HALFSPAN, size=2)
         theta = rng_np.uniform(-np.pi, np.pi)
@@ -333,21 +339,16 @@ def generate_world(num_gates, seed=SEED):
         if not within_bounds(dock, bounds, BOUND_MARGIN): continue
         if not within_bounds(app,  bounds, BOUND_MARGIN): continue
 
-        # must not collide with other gates at dock or approach
         if square_collides_walls(dock, th, S, other_walls): continue
         if square_collides_walls(app,  th, S, other_walls): continue
 
         gw = g.walls_world()
-
-        # must fit at dock / approach relative to its own walls
         if square_collides_walls(dock, th, S, gw): continue
         if square_collides_walls(app,  th, S, gw): continue
 
-        # docking move approach->dock must be feasible (forward)
+        # docking & undocking must work as straight segments
         if not drive_straight_free(app[0], app[1], dock[0], dock[1], th, S, gw, bounds, BOUND_MARGIN):
             continue
-
-        # undock move dock->approach must be feasible (reverse, same heading)
         if not drive_straight_free(dock[0], dock[1], app[0], app[1], th, S, gw, bounds, BOUND_MARGIN):
             continue
 
@@ -362,7 +363,7 @@ def generate_world(num_gates, seed=SEED):
     return gates, walls, bounds
 
 # ============================================================
-# LAZY PRM (kNN by XY, edges validated on-demand)
+# LAZY PRM
 # ============================================================
 def build_knn_lists(nodes, k):
     xy = np.array([[n[0], n[1]] for n in nodes], dtype=float)
@@ -387,8 +388,7 @@ def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, exp
         gx, gy, _ = nodes[goal_idx]
         return math.hypot(gx-x, gy-y)
 
-    # cache: (min,max) -> (ok, used_reverse)
-    edge_cache = {}
+    edge_cache = {}  # (min,max) -> (ok, used_reverse)
 
     def edge_eval(i, j):
         a = i if i < j else j
@@ -403,11 +403,10 @@ def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, exp
     pq = []
     heapq.heappush(pq, (h(start_idx), 0.0, start_idx, -1))
     came = {}
-    came_edge_rev = {}   # node -> used_reverse from parent edge
     gbest = {start_idx: 0.0}
     closed = set()
-
     expansions = 0
+
     while pq:
         f, g, u, parent = heapq.heappop(pq)
         if u in closed:
@@ -416,7 +415,6 @@ def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, exp
         came[u] = parent
 
         if u == goal_idx:
-            # reconstruct node index path
             idx_path = []
             cur = u
             while cur != -1:
@@ -424,7 +422,6 @@ def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, exp
                 cur = came[cur]
             idx_path.reverse()
 
-            # reconstruct used_reverse flags per edge
             rev_flags = []
             for a_i, b_i in zip(idx_path[:-1], idx_path[1:]):
                 ok, used_rev = edge_eval(a_i, b_i)
@@ -446,63 +443,224 @@ def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, exp
             if (v not in gbest) or (ng < gbest[v] - 1e-9):
                 gbest[v] = ng
                 heapq.heappush(pq, (ng + h(v), ng, v, u))
+
     return None
 
 # ============================================================
-# PLANNING WITH DOCK/UNDOCK CONSTRAINTS
+# PATH SMOOTHING (shortcut + Chaikin + constant speed)
 # ============================================================
-def densify_straight_pose(a_xy, b_xy, th, ds=0.05):
-    ax, ay = a_xy
-    bx, by = b_xy
-    dx, dy = bx-ax, by-ay
-    dist = math.hypot(dx, dy)
-    n = max(1, int(dist/ds))
+def unique_xy(points, tol=1e-6):
     out = []
-    for i in range(n+1):
-        t = i/n
-        out.append((ax + t*dx, ay + t*dy, th))
+    last = None
+    for p in points:
+        if last is None or (abs(p[0]-last[0]) > tol or abs(p[1]-last[1]) > tol):
+            out.append(np.array([p[0], p[1]], dtype=float))
+            last = p
+    return out
+
+def chaikin(points_xy, iters):
+    # Chaikin corner cutting on open polyline
+    pts = [np.array(p, dtype=float) for p in points_xy]
+    for _ in range(iters):
+        if len(pts) < 3:
+            return pts
+        new_pts = [pts[0]]
+        for i in range(len(pts)-1):
+            p = pts[i]
+            q = pts[i+1]
+            Q = 0.75*p + 0.25*q
+            R = 0.25*p + 0.75*q
+            new_pts.extend([Q, R])
+        new_pts[-1] = pts[-1]
+        pts = new_pts
+    return pts
+
+def resample_polyline(points_xy, step):
+    pts = [np.array(p, dtype=float) for p in points_xy]
+    if len(pts) < 2:
+        return pts
+
+    # cumulative arc length
+    segs = [np.linalg.norm(pts[i+1]-pts[i]) for i in range(len(pts)-1)]
+    L = float(np.sum(segs))
+    if L < 1e-9:
+        return [pts[0]]
+
+    n = max(2, int(L/step) + 1)
+    targets = np.linspace(0.0, L, n)
+
+    out = [pts[0]]
+    cur_seg = 0
+    cur_s = 0.0
+    for tL in targets[1:]:
+        while cur_seg < len(segs) and (cur_s + segs[cur_seg]) < tL - 1e-12:
+            cur_s += segs[cur_seg]
+            cur_seg += 1
+        if cur_seg >= len(segs):
+            out.append(pts[-1])
+            continue
+        a = pts[cur_seg]
+        b = pts[cur_seg+1]
+        segL = segs[cur_seg]
+        if segL < 1e-12:
+            out.append(a.copy())
+            continue
+        u = (tL - cur_s) / segL
+        out.append(a + u*(b-a))
+    return out
+
+def tangent_headings(resampled_xy, th_start=None, th_end=None):
+    xy = [np.array(p, dtype=float) for p in resampled_xy]
+    n = len(xy)
+    th = []
+    for i in range(n):
+        if i == n-1:
+            v = xy[i] - xy[i-1]
+        else:
+            v = xy[i+1] - xy[i]
+        ang = math.atan2(v[1], v[0]) if np.linalg.norm(v) > 1e-12 else (th[-1] if th else 0.0)
+        th.append(ang)
+
+    # softly lock endpoints (to match approach headings)
+    if th_start is not None:
+        th[0] = th_start
+        if n > 1:
+            th[1] = wrap_angle(0.7*th[1] + 0.3*th_start)
+    if th_end is not None:
+        th[-1] = th_end
+        if n > 1:
+            th[-2] = wrap_angle(0.7*th[-2] + 0.3*th_end)
+    return th
+
+def validate_states(states, walls, bounds, margin):
+    for x, y, th in states:
+        if not within_bounds((x, y), bounds, margin):
+            return False
+        if square_collides_walls((x, y), th, S, walls):
+            return False
+    return True
+
+def smooth_free_segment(raw_states, th_start, th_end, walls, bounds, margin):
+    """
+    raw_states: list[(x,y,th)] for the middle free-space portion.
+    Returns smoothed states with approx constant spatial step, or None.
+    """
+    raw_xy = unique_xy([(s[0], s[1]) for s in raw_states])
+    if len(raw_xy) < 3:
+        # no point smoothing
+        out = [(p[0], p[1], th_start) for p in raw_xy]
+        return out
+
+    for iters in range(CHAIKIN_ITERS_MAX, -1, -1):
+        pts = chaikin(raw_xy, iters)
+        pts = resample_polyline(pts, RESAMPLE_STEP)
+        ths = tangent_headings(pts, th_start=th_start, th_end=th_end)
+        states = [(float(p[0]), float(p[1]), float(ths[i])) for i, p in enumerate(pts)]
+        if validate_states(states, walls, bounds, margin):
+            return states
+    return None
+
+def shortcut_path(states, walls, bounds, margin, tries=SHORTCUT_TRIES):
+    """
+    Shortcut the free-space portion using our exact edge checker (rotate/drive/reverse),
+    then densify again.
+    """
+    if len(states) < 4:
+        return states
+
+    # pick "key poses" sparsely: use every ~6th point to reduce overhead
+    key = states[::6]
+    if np.linalg.norm(np.array([states[-1][0],states[-1][1]]) - np.array([key[-1][0],key[-1][1]])) > 1e-9:
+        key.append(states[-1])
+
+    key = [(k[0], k[1], k[2]) for k in key]
+
+    for _ in range(tries):
+        if len(key) < 3:
+            break
+        i = random.randint(0, len(key)-3)
+        j = random.randint(i+2, len(key)-1)
+        a = key[i]
+        b = key[j]
+        ok, used_rev = se2_edge_free_with_reverse(a, b, S, walls, bounds, margin)
+        if not ok:
+            continue
+        # if valid, remove intermediate nodes i+1..j-1
+        key = key[:i+1] + key[j:]
+
+    # densify the shortcut keypath into a new state list
+    out = []
+    for a, b in zip(key[:-1], key[1:]):
+        ok, used_rev = se2_edge_free_with_reverse(a, b, S, walls, bounds, margin)
+        if not ok:
+            # fallback: if shortcut produced something inconsistent, just bail out
+            return states
+        seg = densify_edge(a, b, used_reverse=used_rev, ds=0.06, dth=0.12)
+        if out:
+            out.extend(seg[1:])
+        else:
+            out.extend(seg)
     return out
 
 # ============================================================
-# MAIN SETUP
+# GLOBAL STATE
 # ============================================================
-random.seed(SEED)
-gates, all_walls, WORLD_BOUNDS = generate_world(NUM_GATES)
+world_seed = BASE_SEED
+gates = []
+all_walls = []
+WORLD_BOUNDS = None
+A_pts = []
+D_pts = []
+H_req = []
 
-xmin, xmax, ymin, ymax = WORLD_BOUNDS
-A_pts = [g.approach_center(APPROACH_L) for g in gates]
-D_pts = [g.dock_center()              for g in gates]
-H_req = [g.required_heading()         for g in gates]
+nodes = []
+nbrs = []
 
-# Start docked at gate 0
 current_gate = 0
 is_docked = True
-rover_state = (D_pts[current_gate][0], D_pts[current_gate][1], H_req[current_gate])
+rover_state = (0.0, 0.0, 0.0)
 
-# Build PRM nodes: random freespace + ALL approach poses (NOT dock poses)
-rng = np.random.default_rng(SEED + 123)
-nodes = []
+executed_xy = []
+planned_playback = None
+play_idx = 0
+moving = False
+goal_gate = None
 
-while len(nodes) < PRM_SAMPLES:
-    x = rng.uniform(xmin + BOUND_MARGIN, xmax - BOUND_MARGIN)
-    y = rng.uniform(ymin + BOUND_MARGIN, ymax - BOUND_MARGIN)
-    th = rng.uniform(-np.pi, np.pi)
-    if square_collides_walls((x, y), th, S, all_walls):
-        continue
-    nodes.append((x, y, th))
+gate_artists = []
+smooth_enabled = SMOOTH_ENABLED_DEFAULT
 
-# Add approach poses as landmarks (planner targets these)
-for i in range(NUM_GATES):
-    nodes.append((A_pts[i][0], A_pts[i][1], H_req[i]))
+gate_colors = [
+    (0.2, 0.7, 0.9),
+    (0.9, 0.55, 0.2),
+    (0.55, 0.9, 0.35),
+    (0.85, 0.35, 0.75),
+    (0.95, 0.9, 0.25),
+]
 
-nbrs = build_knn_lists(nodes, PRM_K)
+# ============================================================
+# PLANNING
+# ============================================================
+def build_prm_for_current_world(seed):
+    rng = np.random.default_rng(seed + 12345)
+    xmin, xmax, ymin, ymax = WORLD_BOUNDS
+
+    local_nodes = []
+    while len(local_nodes) < PRM_SAMPLES:
+        x = rng.uniform(xmin + BOUND_MARGIN, xmax - BOUND_MARGIN)
+        y = rng.uniform(ymin + BOUND_MARGIN, ymax - BOUND_MARGIN)
+        th = rng.uniform(-np.pi, np.pi)
+        if square_collides_walls((x, y), th, S, all_walls):
+            continue
+        local_nodes.append((x, y, th))
+
+    # add approach poses as landmarks
+    for i in range(NUM_GATES):
+        local_nodes.append((A_pts[i][0], A_pts[i][1], H_req[i]))
+
+    local_nbrs = build_knn_lists(local_nodes, PRM_K)
+    return local_nodes, local_nbrs
 
 def plan_free_space(start_pose, goal_pose):
-    """
-    Plan in free space from start_pose to goal_pose using lazy PRM.
-    start/goal are temporary nodes.
-    Returns playback states.
-    """
     tmp_nodes = nodes + [start_pose, goal_pose]
     start_idx = len(tmp_nodes) - 2
     goal_idx  = len(tmp_nodes) - 1
@@ -515,7 +673,6 @@ def plan_free_space(start_pose, goal_pose):
     tmp_nbrs[start_idx] = start_neighbors
     tmp_nbrs[goal_idx]  = goal_neighbors
 
-    # symmetric links to improve connectivity
     for j in start_neighbors:
         tmp_nbrs[j] = list(set(tmp_nbrs[j] + [start_idx]))
     for j in goal_neighbors:
@@ -544,16 +701,58 @@ def plan_free_space(start_pose, goal_pose):
             playback.extend(seg[1:])
         else:
             playback.extend(seg)
-
     return playback
 
-def plan_to_gate(goal_gate):
+def smooth_playback(full_playback, cur_gate, goal_gate_idx):
     """
-    Full behavior:
-    - If docked: UNDock straight out (reverse allowed) dock -> approach at fixed heading
-    - Free-space PRM plan: approach(current) -> approach(goal)
-    - Dock straight in (forward) approach -> dock at required heading
+    Keep UNDock and Dock rigid.
+    Smooth only the middle free-space segment.
     """
+    if not smooth_enabled:
+        return full_playback
+
+    cur_app = A_pts[cur_gate]
+    goal_app = A_pts[goal_gate_idx]
+    cur_th = H_req[cur_gate]
+    goal_th = H_req[goal_gate_idx]
+
+    # find first index near cur_app (end of undock)
+    end_undock = None
+    for i, (x,y,th) in enumerate(full_playback):
+        if (x-cur_app[0])**2 + (y-cur_app[1])**2 < END_LOCK_TOL**2:
+            end_undock = i
+            break
+    # find last index near goal_app (start of dock)
+    start_dock = None
+    for i in range(len(full_playback)-1, -1, -1):
+        x,y,th = full_playback[i]
+        if (x-goal_app[0])**2 + (y-goal_app[1])**2 < END_LOCK_TOL**2:
+            start_dock = i
+            break
+
+    if end_undock is None or start_dock is None or start_dock <= end_undock + 5:
+        return full_playback
+
+    prefix = full_playback[:end_undock+1]
+    middle = full_playback[end_undock:start_dock+1]
+    suffix = full_playback[start_dock:]
+
+    # 1) shortcut middle to reduce stop/go
+    middle2 = shortcut_path(middle, all_walls, WORLD_BOUNDS, BOUND_MARGIN, tries=SHORTCUT_TRIES)
+
+    # 2) smooth XY and constant-speed resample; compute tangent headings
+    sm = smooth_free_segment(middle2, th_start=cur_th, th_end=goal_th,
+                             walls=all_walls, bounds=WORLD_BOUNDS, margin=BOUND_MARGIN)
+    if sm is None:
+        return full_playback
+
+    # stitch, ensuring continuity without duplicate points
+    out = prefix[:-1] + sm + suffix[1:]
+    if not validate_states(out, all_walls, WORLD_BOUNDS, BOUND_MARGIN):
+        return full_playback
+    return out
+
+def plan_to_gate(goal_gate_idx):
     global current_gate, is_docked, rover_state
 
     cur = current_gate
@@ -561,56 +760,48 @@ def plan_to_gate(goal_gate):
     cur_dock = D_pts[cur]
     cur_app  = A_pts[cur]
 
-    goal_th = H_req[goal_gate]
-    goal_dock = D_pts[goal_gate]
-    goal_app  = A_pts[goal_gate]
+    goal_th = H_req[goal_gate_idx]
+    goal_dock = D_pts[goal_gate_idx]
+    goal_app  = A_pts[goal_gate_idx]
 
     playback = []
 
-    # 1) UNDock if needed (dock->approach at fixed heading, translation direction doesn't matter for collision)
+    # UNDock
     if is_docked:
-        # note: this is a straight line along -normal; heading stays cur_th
         undock = densify_straight_pose((cur_dock[0], cur_dock[1]), (cur_app[0], cur_app[1]), cur_th, ds=0.05)
-
-        # validate against ALL walls except we allow touching due to EPS
         for x, y, th in undock:
             if square_collides_walls((x, y), th, S, all_walls):
                 return None
         playback.extend(undock)
-
-        # now we are "free"
         start_pose = (cur_app[0], cur_app[1], cur_th)
     else:
         start_pose = rover_state
 
-    # 2) PRM plan in free space to goal approach pose
+    # Free-space plan approach->approach
     goal_pose = (goal_app[0], goal_app[1], goal_th)
     free_path = plan_free_space(start_pose, goal_pose)
     if free_path is None:
         return None
+    playback.extend(free_path[1:])  # connect
 
-    # ensure continuity
-    if playback:
-        playback.extend(free_path[1:])
-    else:
-        playback.extend(free_path)
-
-    # 3) DOCK: approach->dock straight-in at required heading (forward docking)
+    # Dock straight
     dock = densify_straight_pose((goal_app[0], goal_app[1]), (goal_dock[0], goal_dock[1]), goal_th, ds=0.05)
     for x, y, th in dock:
         if square_collides_walls((x, y), th, S, all_walls):
             return None
     playback.extend(dock[1:])
 
-    return playback
+    # Smooth + constant-speed in the free-space segment
+    playback2 = smooth_playback(playback, cur_gate=cur, goal_gate_idx=goal_gate_idx)
+    return playback2
 
 # ============================================================
-# VISUALIZATION
+# FIGURE / UI
 # ============================================================
 fig, ax = plt.subplots(figsize=(9.5, 9.5))
-ax.set_aspect("equal", "box")
-ax.set_xlim(xmin, xmax); ax.set_ylim(ymin, ymax)
+plt.subplots_adjust(bottom=0.14)
 
+ax.set_aspect("equal", "box")
 ax.set_facecolor((0.06, 0.07, 0.09))
 fig.patch.set_facecolor((0.06, 0.07, 0.09))
 for spine in ax.spines.values():
@@ -618,47 +809,105 @@ for spine in ax.spines.values():
 ax.tick_params(colors=(0.75, 0.75, 0.8))
 ax.grid(True, alpha=0.12)
 
-ax.set_title("Click a gate: UNDock → Lazy PRM (reverse allowed) → Dock",
-             color=(0.9, 0.9, 0.95), pad=12)
-
-gate_colors = [
-    (0.2, 0.7, 0.9),
-    (0.9, 0.55, 0.2),
-    (0.55, 0.9, 0.35),
-    (0.85, 0.35, 0.75),
-    (0.95, 0.9, 0.25),
-]
-
-for i, g in enumerate(gates):
-    col = gate_colors[i % len(gate_colors)]
-    for (w0, w1) in g.walls_world():
-        ax.plot([w0[0], w1[0]], [w0[1], w1[1]],
-                linewidth=3.2, alpha=0.9, color=col, solid_capstyle="round")
-    p1, p2 = g.opening_endpoints_world()
-    ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], s=24, color=col, alpha=0.95)
-    ax.scatter([A_pts[i][0]], [A_pts[i][1]], s=70, marker="x", color=(1,1,1), alpha=0.75)
-    ax.scatter([D_pts[i][0]], [D_pts[i][1]], s=55, marker="o",
-               edgecolors=col, facecolors="none", linewidths=2)
-    ax.text(g.center[0], g.center[1], f"G{i}",
-            color=(0.95,0.95,0.98), ha="center", va="center",
-            fontsize=11, alpha=0.95)
-
-rover_poly = Polygon(square_corners((rover_state[0], rover_state[1]), rover_state[2], S),
-                     closed=True, facecolor=(0.92, 0.92, 0.95),
-                     edgecolor=(0.1, 0.1, 0.1), linewidth=2.2, alpha=0.95)
-ax.add_patch(rover_poly)
-
 plan_line, = ax.plot([], [], linestyle="--", linewidth=2.2, alpha=0.8,
                      color=(0.9, 0.9, 0.95))
 trail_line, = ax.plot([], [], linewidth=2.0, alpha=0.55,
                       color=(0.7, 0.75, 0.9))
 
-executed_xy = [np.array([rover_state[0], rover_state[1]])]
-planned_playback = None
-play_idx = 0
-moving = False
-goal_gate = None
+rover_poly = Polygon(square_corners((0, 0), 0.0, S),
+                     closed=True, facecolor=(0.92, 0.92, 0.95),
+                     edgecolor=(0.1, 0.1, 0.1), linewidth=2.2, alpha=0.95)
+ax.add_patch(rover_poly)
 
+# Buttons
+btn_ax1 = fig.add_axes([0.12, 0.04, 0.22, 0.06])
+btn_rerand = Button(btn_ax1, "Rerandomize gates")
+
+btn_ax2 = fig.add_axes([0.38, 0.04, 0.18, 0.06])
+btn_smooth = Button(btn_ax2, "Smooth: ON" if smooth_enabled else "Smooth: OFF")
+
+# ============================================================
+# DRAW / RESET
+# ============================================================
+def clear_gate_artists():
+    global gate_artists
+    for a in gate_artists:
+        try:
+            a.remove()
+        except Exception:
+            pass
+    gate_artists = []
+
+def redraw_world():
+    global executed_xy, planned_playback, play_idx, moving, goal_gate
+
+    xmin, xmax, ymin, ymax = WORLD_BOUNDS
+    ax.set_xlim(xmin, xmax)
+    ax.set_ylim(ymin, ymax)
+
+    clear_gate_artists()
+
+    for i, g in enumerate(gates):
+        col = gate_colors[i % len(gate_colors)]
+        for (w0, w1) in g.walls_world():
+            ln, = ax.plot([w0[0], w1[0]], [w0[1], w1[1]],
+                          linewidth=3.2, alpha=0.9, color=col, solid_capstyle="round")
+            gate_artists.append(ln)
+
+        p1, p2 = g.opening_endpoints_world()
+        sc1 = ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], s=24, color=col, alpha=0.95)
+        gate_artists.append(sc1)
+
+        scA = ax.scatter([A_pts[i][0]], [A_pts[i][1]], s=70, marker="x", color=(1,1,1), alpha=0.75)
+        gate_artists.append(scA)
+
+        scD = ax.scatter([D_pts[i][0]], [D_pts[i][1]], s=55, marker="o",
+                         edgecolors=col, facecolors="none", linewidths=2)
+        gate_artists.append(scD)
+
+        txt = ax.text(g.center[0], g.center[1], f"G{i}",
+                      color=(0.95,0.95,0.98), ha="center", va="center",
+                      fontsize=11, alpha=0.95)
+        gate_artists.append(txt)
+
+    plan_line.set_data([], [])
+    trail_line.set_data([], [])
+
+    rover_poly.set_xy(square_corners((rover_state[0], rover_state[1]), rover_state[2], S))
+    executed_xy = [np.array([rover_state[0], rover_state[1]])]
+
+    planned_playback = None
+    play_idx = 0
+    moving = False
+    goal_gate = None
+
+    ax.set_title("Click a gate: UNDock → Lazy PRM (reverse allowed) → Dock",
+                 color=(0.9, 0.9, 0.95), pad=12)
+    fig.canvas.draw_idle()
+
+def reset_world(new_seed):
+    global world_seed, gates, all_walls, WORLD_BOUNDS, A_pts, D_pts, H_req
+    global nodes, nbrs
+    global current_gate, is_docked, rover_state
+
+    world_seed = new_seed
+    gates, all_walls, WORLD_BOUNDS = generate_world(NUM_GATES, world_seed)
+
+    A_pts = [g.approach_center(APPROACH_L) for g in gates]
+    D_pts = [g.dock_center()              for g in gates]
+    H_req = [g.required_heading()         for g in gates]
+
+    nodes, nbrs = build_prm_for_current_world(world_seed)
+
+    current_gate = 0
+    is_docked = True
+    rover_state = (D_pts[current_gate][0], D_pts[current_gate][1], H_req[current_gate])
+
+    redraw_world()
+
+# ============================================================
+# INPUT
+# ============================================================
 def nearest_gate_click(xy):
     d = [np.linalg.norm(D_pts[i] - xy) for i in range(NUM_GATES)]
     i = int(np.argmin(d))
@@ -675,14 +924,12 @@ def on_click(event):
     if gidx == current_gate:
         return
 
-    ax.set_title(f"Planning: Gate {current_gate} → Gate {gidx} ...",
-                 color=(0.9,0.9,0.95))
+    ax.set_title(f"Planning: Gate {current_gate} → Gate {gidx} ...", color=(0.9,0.9,0.95))
     fig.canvas.draw_idle()
 
     plan = plan_to_gate(gidx)
     if plan is None:
-        ax.set_title("No path found. If this happens often: increase PRM_SAMPLES/PRM_K.",
-                     color=(0.95, 0.6, 0.6))
+        ax.set_title("No path found. If frequent: increase PRM_SAMPLES/PRM_K.", color=(0.95, 0.6, 0.6))
         fig.canvas.draw_idle()
         return
 
@@ -695,14 +942,29 @@ def on_click(event):
     ys = [p[1] for p in planned_playback]
     plan_line.set_data(xs, ys)
 
-    ax.set_title(f"Executing: Gate {current_gate} → Gate {gidx}",
-                 color=(0.9,0.9,0.95))
+    ax.set_title(f"Executing: Gate {current_gate} → Gate {gidx}", color=(0.9,0.9,0.95))
     fig.canvas.draw_idle()
 
 fig.canvas.mpl_connect("button_press_event", on_click)
 
+def on_rerandomize(_event):
+    reset_world(world_seed + 1)
+
+def on_toggle_smooth(_event):
+    global smooth_enabled
+    smooth_enabled = not smooth_enabled
+    btn_smooth.label.set_text("Smooth: ON" if smooth_enabled else "Smooth: OFF")
+    fig.canvas.draw_idle()
+
+btn_rerand.on_clicked(on_rerandomize)
+btn_smooth.on_clicked(on_toggle_smooth)
+
+# ============================================================
+# ANIMATION
+# ============================================================
 def animate(_):
-    global rover_state, planned_playback, play_idx, moving, current_gate, goal_gate, is_docked
+    global rover_state, planned_playback, play_idx, moving, current_gate, goal_gate, is_docked, executed_xy
+
     if moving and planned_playback is not None:
         for _k in range(PLAYBACK_SKIP):
             if play_idx >= len(planned_playback):
@@ -712,7 +974,6 @@ def animate(_):
         executed_xy.append(np.array([rover_state[0], rover_state[1]]))
 
         if play_idx >= len(planned_playback):
-            # arrived: snap to exact dock pose
             rover_state = (D_pts[goal_gate][0], D_pts[goal_gate][1], H_req[goal_gate])
             executed_xy.append(np.array([rover_state[0], rover_state[1]]))
             current_gate = goal_gate
@@ -729,5 +990,9 @@ def animate(_):
     trail_line.set_data(t[:, 0], t[:, 1])
     return rover_poly, plan_line, trail_line
 
+# ============================================================
+# BOOT
+# ============================================================
+reset_world(BASE_SEED)
 ani = FuncAnimation(fig, animate, interval=FRAME_MS, blit=False)
 plt.show()
