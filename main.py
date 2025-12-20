@@ -1207,7 +1207,16 @@ def animate(_):
                 and rover_play_idx[i] <= rover_intersection_max_idx[i]
             ]
             if pending:
-                allowed_to_move.add(min(pending))
+                lead = min(pending)
+                for i in comp:
+                    if rover_intersection_max_idx[i] < 0:
+                        allowed_to_move.add(i)
+                        continue
+                    if i == lead:
+                        allowed_to_move.add(i)
+                        continue
+                    if rover_play_idx[i] < rover_intersection_max_idx[i]:
+                        allowed_to_move.add(i)
             else:
                 for i in comp:
                     allowed_to_move.add(i)
