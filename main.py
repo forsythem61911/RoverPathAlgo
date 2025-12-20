@@ -940,9 +940,17 @@ def reset_rovers(count):
 def pick_next_gate(rover_idx):
     cur = rover_current_gates[rover_idx]
     last = rover_last_gates[rover_idx]
-    candidates = [i for i in range(NUM_GATES) if i != cur and i != last]
+    occupied = {
+        rover_current_gates[i]
+        for i in range(len(rover_current_gates))
+        if i != rover_idx and rover_docked[i]
+    }
+    candidates = [
+        i for i in range(NUM_GATES)
+        if i != cur and i != last and i not in occupied
+    ]
     if not candidates:
-        candidates = [i for i in range(NUM_GATES) if i != cur]
+        candidates = [i for i in range(NUM_GATES) if i != cur and i not in occupied]
     if not candidates:
         return cur
 
