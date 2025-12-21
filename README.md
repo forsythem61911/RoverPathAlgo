@@ -2,6 +2,14 @@
 
 RoverPathAlgo is a self-contained Python simulation that animates one or more square “rovers” navigating between dockable gates inside a bounded world. It combines geometry utilities, a probabilistic roadmap (PRM) planner with A* search, optional path smoothing, and a lightweight traffic-resolution policy so multiple rovers can move without colliding. The entire application lives in `main.py` and runs with Matplotlib.
 
+[![Launch Binder](https://mybinder.org/badge_logo.svg)](https://mybinder.org/v2/gh/forsythem61911/RoverPathAlgo/main?urlpath=lab/tree/demo.ipynb)
+
+## Run in your browser (no installs)
+
+Open the simulation directly in JupyterLab on Binder:
+
+https://mybinder.org/v2/gh/forsythem61911/RoverPathAlgo/main?urlpath=lab/tree/demo.ipynb
+
 ## Quick start
 
 ```bash
