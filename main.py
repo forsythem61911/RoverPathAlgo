@@ -2,6 +2,8 @@ import math, random, heapq
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from collections import deque
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -42,16 +44,32 @@ RESAMPLE_STEP = 0.06
 END_LOCK_TOL = 0.08
 
 # perf / UI
-TRAIL_MAX = 2500
-TITLE_EVERY = 6
+TRAIL_MAX = 500
+TRAIL_DRAW_EVERY = 3
+FAST_VIS = True
+TITLE_EVERY = 999999  # avoid frequent title redraw (expensive)
 
-# rover collision geometry:
-# wall collision can use slightly-inscribed circle (lets you fit gates tightly)
+# background planner
+PLANNER_WORKERS = 1
+
+# rover collision geometry
 ROVER_R_WALL = (S / 2.0) * 0.95
-# rover-rover must use circumscribed circle of square to prevent overlaps
 ROVER_R_ROVER = (math.sqrt(2) / 2.0) * S * 0.99
 ROVER_SEP = 2.0 * ROVER_R_ROVER * 1.03
 ROVER_SEP2 = ROVER_SEP * ROVER_SEP
+
+# ===================== COLLISION POLICY (REFINED) =====================
+WAIT_BEFORE_YIELD = 10          # frames to just wait if blocked
+YIELD_COOLDOWN = 45             # don't yield repeatedly
+BACKOFF_INDICES = 80            # reverse this many path indices (short distance; path is dense)
+BACKOFF_MIN_IDX = 10            # only reverse if idx >= this
+REPLAN_TRIGGER = 70             # stuck frames before requesting background replan
+REPLAN_COOLDOWN = 35            # frames between replans
+
+# if reversing is impossible (near path start), inject a tiny backoff segment
+BACKOFF_STEP = 0.04             # world units per injected point
+BACKOFF_PTS = 12                # number of injected points
+FORCE_STEP_FRAMES = 22          # force step-by-step (no skipping) for a bit after backoff insert
 
 
 # ===================== MATH / GEOM =====================
@@ -90,7 +108,6 @@ def pt_seg_d2(p, a, b):
     return float(np.dot(d, d))
 
 def seg_seg_d2(a, b, c, d):
-    # 2D segment–segment minimum distance squared
     return min(
         pt_seg_d2(a, c, d), pt_seg_d2(b, c, d),
         pt_seg_d2(c, a, b), pt_seg_d2(d, a, b)
@@ -211,7 +228,17 @@ class Rover:
     reverse_target: int = 0
     blocked_by: int = -1
 
-    plan_cd: int = 0  # cooldown frames to avoid replan spikes
+    plan_cd: int = 0
+
+    # background planning
+    plan_future: Optional[object] = None
+    plan_token: int = 0
+    plan_replaces_existing: bool = False
+    replan_cd: int = 0
+
+    # refined collision behavior
+    yield_cd: int = 0         # cooldown to avoid thrashing
+    force_step: int = 0       # force step-by-step movement briefly (no skipping)
 
     trail: deque = field(default_factory=lambda: deque(maxlen=TRAIL_MAX))
 
@@ -232,12 +259,12 @@ def knn_lists(nodes, k):
         out.append([j for j in idx if j != i][:k])
     return out
 
-def knn_temp(pose, base_nodes, k):
-    xy = np.array([(n[0], n[1]) for n in base_nodes], float)
+def knn_temp_xy(pose, xy, k):
     x, y, _ = pose
-    d2 = np.sum((xy - np.array([x, y]))**2, axis=1)
+    d2 = (xy[:,0]-x)**2 + (xy[:,1]-y)**2
     idx = np.argpartition(d2, k)[:k]
-    return idx[np.argsort(d2[idx])].tolist()
+    idx = idx[np.argsort(d2[idx])]
+    return idx.tolist()
 
 def se2_cost(a, b):
     ax, ay, ath = a
@@ -429,14 +456,9 @@ def shortcut(states, WI, bounds, margin, tries=SHORTCUT_TRIES):
         out += seg[1:] if out else seg
     return out
 
-def smooth_mid(playback, cur_gate, goal_gate, gates, WI, bounds, margin, enabled):
+def smooth_mid_points(playback, cur_app, goal_app, th0, th1, WI, bounds, margin, enabled):
     if (not enabled) or len(playback) < 12:
         return playback
-
-    cur_app = gates[cur_gate].approach
-    goal_app = gates[goal_gate].approach
-    th0 = gates[cur_gate].heading
-    th1 = gates[goal_gate].heading
 
     end_u = next((i for i, (x, y, _) in enumerate(playback)
                   if (x-cur_app[0])**2 + (y-cur_app[1])**2 < END_LOCK_TOL**2), None)
@@ -465,6 +487,93 @@ def smooth_mid(playback, cur_gate, goal_gate, gates, WI, bounds, margin, enabled
     return playback
 
 
+# ===================== BACKGROUND PLANNER (PROCESS) =====================
+_W_NODES = None
+_W_NBRS = None
+_W_NODE_XY = None
+_W_WI = None
+_W_BOUNDS = None
+
+def _worker_init(nodes, nbrs, walls, bounds):
+    global _W_NODES, _W_NBRS, _W_NODE_XY, _W_WI, _W_BOUNDS
+    _W_NODES = nodes
+    _W_NBRS = nbrs
+    _W_NODE_XY = np.array([(n[0], n[1]) for n in nodes], float)
+    _W_WI = WallIndex(walls)
+    _W_BOUNDS = bounds
+
+def _plan_worker(cur_state, docked,
+                 cur_dock, cur_app, cur_heading,
+                 goal_app, goal_dock, goal_heading,
+                 obstacle_pts, smooth_enabled):
+    def blocked_by_rovers_xy(x, y):
+        for ox, oy in obstacle_pts:
+            if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
+                return True
+        return False
+
+    pb = []
+    if docked:
+        und = densify_straight(cur_dock, cur_app, cur_heading)
+        for x, y, _ in und:
+            if _W_WI.collides_pose(x, y, _W_BOUNDS, BOUND_MARGIN, r=ROVER_R_WALL):
+                return None
+            if blocked_by_rovers_xy(x, y):
+                return None
+        pb += und
+        start = (float(cur_app[0]), float(cur_app[1]), float(cur_heading))
+    else:
+        start = cur_state
+
+    goal_pose = (float(goal_app[0]), float(goal_app[1]), float(goal_heading))
+
+    tmp_nodes = _W_NODES + [start, goal_pose]
+    si = len(tmp_nodes) - 2
+    gi = len(tmp_nodes) - 1
+
+    tmp_nbrs = [lst[:] for lst in _W_NBRS] + [[], []]
+    sN = knn_temp_xy(start, _W_NODE_XY, TEMP_K)
+    gN = knn_temp_xy(goal_pose, _W_NODE_XY, TEMP_K)
+    tmp_nbrs[si] = sN
+    tmp_nbrs[gi] = gN
+    for j in sN:
+        tmp_nbrs[j].append(si)
+    for j in gN:
+        tmp_nbrs[j].append(gi)
+
+    def edge_ok(a, b):
+        ax, ay, _ = a
+        bx, by, _ = b
+        if _W_WI.collides_pose(ax, ay, _W_BOUNDS, BOUND_MARGIN, r=ROVER_R_WALL): return False
+        if _W_WI.collides_pose(bx, by, _W_BOUNDS, BOUND_MARGIN, r=ROVER_R_WALL): return False
+        if blocked_by_rovers_xy(ax, ay) or blocked_by_rovers_xy(bx, by): return False
+        if _W_WI.collides_seg((ax, ay), (bx, by), _W_BOUNDS, BOUND_MARGIN, r=ROVER_R_WALL): return False
+        mx, my = 0.5*(ax+bx), 0.5*(ay+by)
+        return not blocked_by_rovers_xy(mx, my)
+
+    idx = astar_lazy(tmp_nodes, tmp_nbrs, si, gi, edge_ok, se2_cost)
+    if idx is None:
+        return None
+
+    pb_free = []
+    for a_i, b_i in zip(idx[:-1], idx[1:]):
+        seg = densify_edge(tmp_nodes[a_i], tmp_nodes[b_i])
+        pb_free += seg[1:] if pb_free else seg
+    pb += pb_free[1:] if pb else pb_free
+
+    dock_seg = densify_straight(goal_app, goal_dock, goal_heading)
+    for x, y, _ in dock_seg:
+        if _W_WI.collides_pose(x, y, _W_BOUNDS, BOUND_MARGIN, r=ROVER_R_WALL):
+            return None
+        if blocked_by_rovers_xy(x, y):
+            return None
+    pb += dock_seg[1:]
+
+    pb = smooth_mid_points(pb, cur_app, goal_app, cur_heading, goal_heading,
+                           _W_WI, _W_BOUNDS, BOUND_MARGIN, smooth_enabled)
+    return pb
+
+
 # ===================== SIM =====================
 class Sim:
     gate_colors = [
@@ -489,6 +598,8 @@ class Sim:
 
         self.nodes = []
         self.nbrs = []
+        self.node_xy = None
+
         self.rovers: List[Rover] = []
 
         self.fig = None
@@ -503,8 +614,26 @@ class Sim:
         self.ani = None
 
         self.frame = 0
+        self.pool: Optional[ProcessPoolExecutor] = None
 
-    # ----- world gen helpers -----
+    # ---------- pool ----------
+    def _shutdown_pool(self):
+        if self.pool is not None:
+            try:
+                self.pool.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
+            self.pool = None
+
+    def _ensure_pool(self):
+        self._shutdown_pool()
+        self.pool = ProcessPoolExecutor(
+            max_workers=PLANNER_WORKERS,
+            initializer=_worker_init,
+            initargs=(self.nodes, self.nbrs, self.walls, self.bounds),
+        )
+
+    # ---------- world gen ----------
     def _circle_hits_walls(self, x, y, walls, r=ROVER_R_WALL):
         p = np.array([x, y], float)
         rr = r*r
@@ -579,7 +708,8 @@ class Sim:
         for g in self.gates:
             nodes.append((float(g.approach[0]), float(g.approach[1]), float(g.heading)))
 
-        return nodes, knn_lists(nodes, PRM_K)
+        nbrs = knn_lists(nodes, PRM_K)
+        return nodes, nbrs
 
     def reset(self, seed):
         self.auto = False
@@ -589,6 +719,7 @@ class Sim:
         self.gates, self.walls, self.bounds = self.generate_world(self.num_docks, seed)
         self.WI.set(self.walls)
         self.nodes, self.nbrs = self.build_prm(seed)
+        self.node_xy = np.array([(n[0], n[1]) for n in self.nodes], float)
 
         self.rovers = []
         for i in range(self.num_rovers):
@@ -599,13 +730,15 @@ class Sim:
                 (float(g.dock[0]), float(g.dock[1]), float(g.heading)),
                 docked=True, moving=False
             )
-            r.trail.append(np.array([g.dock[0], g.dock[1]], float))
+            r.trail.append((float(g.dock[0]), float(g.dock[1])))
             self.rovers.append(r)
+
+        self._ensure_pool()
 
         if self.ax is not None:
             self.redraw()
 
-    # ----- dock logic -----
+    # ---------- dock logic ----------
     def dock_free(self, dock, exclude=-1):
         for r in self.rovers:
             if r.id == exclude:
@@ -636,103 +769,133 @@ class Sim:
                 bestd, best = d, i
         return best
 
-    # ----- planning -----
-    def plan_prm(self, start, goal, obstacle_pts):
-        tmp_nodes = self.nodes + [start, goal]
-        si = len(tmp_nodes) - 2
-        gi = len(tmp_nodes) - 1
-
-        tmp_nbrs = [lst[:] for lst in self.nbrs] + [[], []]
-        sN = knn_temp(start, self.nodes, TEMP_K)
-        gN = knn_temp(goal, self.nodes, TEMP_K)
-        tmp_nbrs[si] = sN
-        tmp_nbrs[gi] = gN
-
-        for j in sN:
-            if si not in tmp_nbrs[j]:
-                tmp_nbrs[j].append(si)
-        for j in gN:
-            if gi not in tmp_nbrs[j]:
-                tmp_nbrs[j].append(gi)
-
-        def blocked_by_rovers_xy(x, y):
-            for ox, oy in obstacle_pts:
-                if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
-                    return True
+    # ---------- safety ----------
+    def pose_safe(self, x, y, exclude_id=-1):
+        if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
             return False
+        for o in self.rovers:
+            if o.id == exclude_id:
+                continue
+            ox, oy, _ = o.state
+            if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
+                return False
+        return True
 
-        def edge_ok(a, b):
-            ax, ay, _ = a
-            bx, by, _ = b
-            if self.WI.collides_pose(ax, ay, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
-            if self.WI.collides_pose(bx, by, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
-            if blocked_by_rovers_xy(ax, ay) or blocked_by_rovers_xy(bx, by): return False
-            if self.WI.collides_seg((ax, ay), (bx, by), self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
-            # extra rover clearance along edge (cheap sample)
-            mx, my = 0.5*(ax+bx), 0.5*(ay+by)
-            return not blocked_by_rovers_xy(mx, my)
-
-        idx = astar_lazy(tmp_nodes, tmp_nbrs, si, gi, edge_ok, se2_cost)
-        if idx is None:
-            return None
-
-        pb = []
-        for a_i, b_i in zip(idx[:-1], idx[1:]):
-            seg = densify_edge(tmp_nodes[a_i], tmp_nodes[b_i])
-            pb += seg[1:] if pb else seg
-        return pb
-
-    def plan_rover(self, r: Rover, goal_gate: int):
+    # ---------- background planning ----------
+    def start_plan_job(self, r: Rover, goal_gate: int, keep_moving: bool):
+        if r.plan_future is not None:
+            return False
         if not self.dock_free(goal_gate, r.id):
             return False
 
         cur = self.gates[r.current_gate]
         goal = self.gates[goal_gate]
-
         obstacle_pts = [(o.state[0], o.state[1]) for o in self.rovers if o.id != r.id]
 
-        pb = []
-        if r.docked:
-            und = densify_straight(cur.dock, cur.approach, cur.heading)
-            for x, y, _ in und:
-                if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
-                    return False
-                for ox, oy in obstacle_pts:
-                    if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
-                        return False
-            pb += und
-            start = (float(cur.approach[0]), float(cur.approach[1]), float(cur.heading))
-        else:
-            start = r.state
-
-        goal_pose = (float(goal.approach[0]), float(goal.approach[1]), float(goal.heading))
-        free = self.plan_prm(start, goal_pose, obstacle_pts)
-        if free is None:
-            return False
-        pb += free[1:]
-
-        dock = densify_straight(goal.approach, goal.dock, goal.heading)
-        for x, y, _ in dock:
-            if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
-                return False
-            for ox, oy in obstacle_pts:
-                if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
-                    return False
-        pb += dock[1:]
-
-        pb = smooth_mid(pb, r.current_gate, goal_gate, self.gates, self.WI, self.bounds, BOUND_MARGIN, self.smooth)
-
-        r.path = pb
-        r.idx = 0
         r.goal_gate = goal_gate
-        r.moving = True
-        r.docked = False
-        r.stuck = 0
-        r.reversing = False
-        r.blocked_by = -1
+        r.plan_replaces_existing = bool(r.moving and r.path)
+        r.plan_token += 1
+        tok = r.plan_token
+
+        if not keep_moving:
+            r.moving = False
+
+        r.plan_future = self.pool.submit(
+            _plan_worker,
+            r.state, r.docked,
+            (float(cur.dock[0]), float(cur.dock[1])),
+            (float(cur.approach[0]), float(cur.approach[1])),
+            float(cur.heading),
+            (float(goal.approach[0]), float(goal.approach[1])),
+            (float(goal.dock[0]), float(goal.dock[1])),
+            float(goal.heading),
+            obstacle_pts,
+            bool(self.smooth),
+        )
+        r.plan_future._tok = tok  # type: ignore[attr-defined]
         return True
 
-    # ----- traffic -----
+    def _nearest_idx(self, path, x, y, max_scan=160):
+        if not path:
+            return 0
+        n = min(len(path), max_scan)
+        best_i = 0
+        best = 1e30
+        for i in range(n):
+            px, py, _ = path[i]
+            d = (px-x)*(px-x) + (py-y)*(py-y)
+            if d < best:
+                best = d
+                best_i = i
+        return best_i
+
+    def poll_plan_jobs(self):
+        for r in self.rovers:
+            f = r.plan_future
+            if f is None or (not f.done()):
+                continue
+            r.plan_future = None
+            tok = getattr(f, "_tok", None)
+            if tok is not None and tok != r.plan_token:
+                continue
+
+            try:
+                pb = f.result()
+            except Exception:
+                pb = None
+
+            if pb is None or len(pb) < 2:
+                if not r.plan_replaces_existing and r.docked:
+                    r.goal_gate = -1
+                    r.plan_cd = 40
+                r.replan_cd = REPLAN_COOLDOWN
+                continue
+
+            x, y, _ = r.state
+            r.path = pb
+            r.idx = self._nearest_idx(pb, x, y)
+            r.moving = True
+            r.docked = False
+            r.stuck = 0
+            r.reversing = False
+            r.blocked_by = -1
+            r.replan_cd = REPLAN_COOLDOWN
+
+            r.force_step = 0
+            r.yield_cd = max(r.yield_cd, 12)
+
+    # ---------- smooth backoff segment (NO TELEPORT) ----------
+    def inject_backoff_segment(self, r: Rover):
+        # Inserts small, closely spaced points behind current pose.
+        # DOES NOT move rover immediately.
+        x, y, th = r.state
+        dx, dy = -math.cos(th), -math.sin(th)
+
+        pts = []
+        for i in range(1, BACKOFF_PTS + 1):
+            nx = x + i * BACKOFF_STEP * dx
+            ny = y + i * BACKOFF_STEP * dy
+            if not self.pose_safe(nx, ny, exclude_id=r.id):
+                break
+            pts.append((float(nx), float(ny), float(th)))
+
+        if not pts:
+            return False
+
+        if r.path is None:
+            r.path = [r.state] + pts
+            r.idx = 0
+            r.moving = True
+        else:
+            ins = min(r.idx + 1, len(r.path))
+            r.path[ins:ins] = pts
+
+        r.force_step = max(r.force_step, FORCE_STEP_FRAMES)
+        r.yield_cd = max(r.yield_cd, YIELD_COOLDOWN)
+        r.stuck = 0
+        return True
+
+    # ---------- traffic ----------
     def resolve_traffic(self):
         active = [r for r in self.rovers if r.moving and r.path]
         if not active:
@@ -746,17 +909,45 @@ class Sim:
                 ni = r.idx - 1
                 desired[r.id] = ni if (ni >= r.reverse_target and ni >= 0) else r.idx
             else:
-                desired[r.id] = min(r.idx + PLAYBACK_SKIP, len(r.path) - 1)
+                if r.force_step > 0:
+                    desired[r.id] = min(r.idx + 1, len(r.path) - 1)
+                else:
+                    desired[r.id] = min(r.idx + PLAYBACK_SKIP, len(r.path) - 1)
 
-        # commit sequentially by priority to avoid simultaneous collisions
-        order = sorted(active, key=lambda rr: (0 if rr.reversing else 1, -rr.stuck, rr.id))
+        # prioritize: reversing first, then closer-to-goal, then lower id
+        def remain(rr: Rover):
+            return (len(rr.path) - 1 - rr.idx) if rr.path else 10**9
 
-        committed_pos = {}     # rid -> np.array([x,y])
-        committed_seg = []     # list of (a,b) segments in this frame (np arrays)
+        order = sorted(active, key=lambda rr: (0 if rr.reversing else 1, remain(rr), rr.id))
+
+        committed_pos = {}   # rid -> np.array([x,y])
+        committed_seg = []   # (a,b)
         moved = set()
         waiting = 0
-
         id_to_rover = {r.id: r for r in self.rovers}
+
+        def move_ok(r: Rover, p0, p1):
+            # vs committed new positions
+            for rid, pos in committed_pos.items():
+                if np.sum((p1 - pos)**2) < ROVER_SEP2:
+                    r.blocked_by = rid
+                    return False
+
+            # vs committed motion segments (prevents clipping / crossings)
+            for a, b in committed_seg:
+                if seg_seg_d2(p0, p1, a, b) < ROVER_SEP2:
+                    return False
+
+            # vs not-yet-committed rovers' CURRENT positions
+            for o in self.rovers:
+                if o.id == r.id or o.id in committed_pos:
+                    continue
+                ox, oy, _ = o.state
+                d2 = (p1[0]-ox)**2 + (p1[1]-oy)**2
+                if d2 < ROVER_SEP2:
+                    r.blocked_by = o.id
+                    return False
+            return True
 
         for r in order:
             ni = desired[r.id]
@@ -766,50 +957,64 @@ class Sim:
                 continue
 
             p0 = np.array([r.state[0], r.state[1]], float)
-            p1 = np.array([r.path[ni][0], r.path[ni][1]], float)
 
-            ok = True
+            # candidates: try desired, then one-step (helps smooth after inserts), then (if not reversing) small extra
+            candidates = [ni]
+            if (not r.reversing) and (ni != r.idx + 1):
+                candidates.append(min(r.idx + 1, len(r.path) - 1))
 
-            # vs committed new positions
-            for pos in committed_pos.values():
-                if np.sum((p1 - pos)**2) < ROVER_SEP2:
-                    ok = False
+            committed = False
+            for cand in candidates:
+                if cand == r.idx:
+                    continue
+                p1 = np.array([r.path[cand][0], r.path[cand][1]], float)
+                if move_ok(r, p0, p1):
+                    r.idx = cand
+                    r.state = r.path[r.idx]
+                    r.trail.append((float(r.state[0]), float(r.state[1])))
+                    committed_pos[r.id] = p1
+                    committed_seg.append((p0, p1))
+                    moved.add(r.id)
+                    committed = True
+                    if r.force_step > 0:
+                        r.force_step -= 1
+                    if not r.reversing:
+                        r.stuck = max(0, r.stuck - 1)
                     break
 
-            # vs committed motion segments (prevents clipping / crossings)
-            if ok:
-                for a, b in committed_seg:
-                    if seg_seg_d2(p0, p1, a, b) < ROVER_SEP2:
-                        ok = False
-                        break
+            if committed:
+                continue
 
-            # conservative vs not-yet-committed rovers' CURRENT positions
-            if ok:
-                for o in self.rovers:
-                    if o.id == r.id or o.id in committed_pos:
-                        continue
-                    ox, oy, _ = o.state
-                    d2 = (p1[0]-ox)**2 + (p1[1]-oy)**2
-                    if d2 < ROVER_SEP2:
-                        ok = False
-                        r.blocked_by = o.id
-                        break
+            waiting += 1
+            r.stuck += 1
 
-            if ok:
-                r.idx = ni
-                r.state = r.path[r.idx]
-                r.trail.append(np.array([r.state[0], r.state[1]], float))
-                committed_pos[r.id] = p1
-                committed_seg.append((p0, p1))
-                moved.add(r.id)
-                if not r.reversing:
-                    r.stuck = max(0, r.stuck - 1)
-            else:
-                waiting += 1
-                r.stuck += 1
+        # Deterministic yield: if blocked, wait a bit, then higher-id yields to lower-id via short reverse
+        for r in active:
+            if r.id in moved:
+                continue
+            if r.reversing:
+                continue
+            if r.yield_cd > 0:
+                continue
+            if r.blocked_by == -1:
+                continue
+            if r.stuck < WAIT_BEFORE_YIELD:
+                continue
 
-        # cycle-breaker: if blocked graph has a cycle, force the highest-id rover in the cycle to reverse
-        # (only if it has room to reverse)
+            # only one of the pair yields: higher id yields
+            if r.id > r.blocked_by:
+                if r.idx >= BACKOFF_MIN_IDX:
+                    r.reversing = True
+                    r.reverse_target = max(0, r.idx - BACKOFF_INDICES)
+                    r.stuck = 0
+                    r.yield_cd = YIELD_COOLDOWN
+                    r.force_step = max(r.force_step, FORCE_STEP_FRAMES)
+                else:
+                    # can't reverse along path; inject a tiny backoff segment (still no teleport)
+                    if self.inject_backoff_segment(r):
+                        r.force_step = max(r.force_step, FORCE_STEP_FRAMES)
+
+        # cycle-breaker: if blocked graph has a cycle, force highest-id rover in cycle to reverse
         blocked_map = {r.id: r.blocked_by for r in active if (r.id not in moved and r.blocked_by != -1)}
         seen = set()
         for start in list(blocked_map.keys()):
@@ -825,13 +1030,14 @@ class Sim:
                     cyc = chain[chain.index(cur):]
                     rid = max(cyc)
                     rr = id_to_rover.get(rid)
-                    if rr and (not rr.reversing) and rr.idx > 10:
+                    if rr and (not rr.reversing) and rr.idx > 2 and rr.yield_cd == 0:
                         rr.reversing = True
-                        rr.reverse_target = max(0, rr.idx - 60)
+                        rr.reverse_target = max(0, rr.idx - BACKOFF_INDICES)
                         rr.stuck = 0
+                        rr.yield_cd = YIELD_COOLDOWN
+                        rr.force_step = max(rr.force_step, FORCE_STEP_FRAMES)
                     break
 
-        # if reversing rover reached target or can’t reverse, stop reversing cleanly next frame
         for r in active:
             if r.reversing and (r.idx <= r.reverse_target or r.idx <= 0):
                 r.reversing = False
@@ -849,7 +1055,7 @@ class Sim:
         for sp in ax.spines.values():
             sp.set_color((0.35, 0.35, 0.4))
         ax.tick_params(colors=(0.75, 0.75, 0.8))
-        ax.grid(True, alpha=0.12)
+        ax.grid(False if FAST_VIS else True, alpha=0.12)
 
         sd = self.fig.add_axes([0.02, 0.75, 0.10, 0.03])
         sd.set_facecolor((0.15, 0.15, 0.18))
@@ -898,29 +1104,36 @@ class Sim:
         for i, g in enumerate(self.gates):
             col = self.gate_colors[i % len(self.gate_colors)]
             for w0, w1 in g.walls:
-                ln, = ax.plot([w0[0], w1[0]], [w0[1], w1[1]], lw=3.2, alpha=0.9, color=col, solid_capstyle="round")
+                ln, = ax.plot([w0[0], w1[0]], [w0[1], w1[1]], lw=3.2, alpha=0.9,
+                              color=col, solid_capstyle="round")
                 self.gate_art.append(ln)
-            self.gate_art.append(ax.scatter([g.open_p1[0], g.open_p2[0]], [g.open_p1[1], g.open_p2[1]], s=24, color=col, alpha=0.95))
-            self.gate_art.append(ax.scatter([g.approach[0]], [g.approach[1]], s=70, marker="x", color=(1,1,1), alpha=0.75))
-            self.gate_art.append(ax.scatter([g.dock[0]], [g.dock[1]], s=55, marker="o", edgecolors=col, facecolors="none", linewidths=2))
-            self.gate_art.append(ax.text(g.center[0], g.center[1], f"G{i}", color=(0.95,0.95,0.98), ha="center", va="center", fontsize=11, alpha=0.95))
+            self.gate_art.append(ax.scatter([g.open_p1[0], g.open_p2[0]],
+                                            [g.open_p1[1], g.open_p2[1]],
+                                            s=24, color=col, alpha=0.95))
+            self.gate_art.append(ax.scatter([g.approach[0]], [g.approach[1]],
+                                            s=70, marker="x", color=(1,1,1), alpha=0.75))
+            self.gate_art.append(ax.scatter([g.dock[0]], [g.dock[1]],
+                                            s=55, marker="o", edgecolors=col, facecolors="none", linewidths=2))
+            self.gate_art.append(ax.text(g.center[0], g.center[1], f"G{i}",
+                                         color=(0.95,0.95,0.98), ha="center", va="center",
+                                         fontsize=11, alpha=0.95))
 
         self.rover_art = []
         for r in self.rovers:
             col = self.rover_colors[r.id % len(self.rover_colors)]
             poly = Polygon(square_corners((r.state[0], r.state[1]), r.state[2], S),
-                           closed=True, facecolor=col, edgecolor=(0.1,0.1,0.1), lw=2.2, alpha=0.95)
+                           closed=True, facecolor=col, edgecolor=(0.1,0.1,0.1),
+                           lw=2.2, alpha=0.95)
             ax.add_patch(poly)
             line, = ax.plot([], [], lw=2.0, alpha=0.55, color=col)
             r.poly, r.line = poly, line
             r.trail.clear()
-            r.trail.append(np.array([r.state[0], r.state[1]], float))
+            r.trail.append((float(r.state[0]), float(r.state[1])))
             self.rover_art.append((poly, line))
 
         self.auto = False
         self.btn_play.label.set_text("Play")
-        ax.set_title(f"Docks: {self.num_docks} | Rovers: {self.num_rovers} | Click gate or press Play",
-                     color=(0.9,0.9,0.95), pad=12)
+        ax.set_title("")
         self.fig.canvas.draw_idle()
 
     # ----- events -----
@@ -948,14 +1161,11 @@ class Sim:
         self.btn_play.label.set_text("Stop" if self.auto else "Play")
         if self.auto:
             for r in self.rovers:
-                if r.docked and not r.moving and r.plan_cd == 0:
+                if r.docked and (not r.moving) and r.plan_cd == 0 and r.plan_future is None:
                     nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
                     if nxt >= 0:
-                        if not self.plan_rover(r, nxt):
+                        if not self.start_plan_job(r, nxt, keep_moving=False):
                             r.plan_cd = 30
-            self.ax.set_title(f"Running | Docks: {self.num_docks} | Rovers: {self.num_rovers}", color=(0.6,0.95,0.6))
-        else:
-            self.ax.set_title(f"Paused | Docks: {self.num_docks} | Rovers: {self.num_rovers}", color=(0.9,0.9,0.95))
         self.fig.canvas.draw_idle()
 
     def nearest_gate(self, xy):
@@ -972,40 +1182,47 @@ class Sim:
         gi, dist = self.nearest_gate(click)
         if dist > 1.6 * S:
             return
-        r = next((rr for rr in self.rovers if rr.docked and not rr.moving and rr.current_gate != gi), None)
+        r = next((rr for rr in self.rovers
+                  if rr.docked and (not rr.moving) and rr.plan_future is None and rr.current_gate != gi), None)
         if r is None:
             return
-
-        self.ax.set_title(f"Planning: Rover {r.id} Gate {r.current_gate} → Gate {gi} ...", color=(0.9,0.9,0.95))
-        self.fig.canvas.draw_idle()
-
-        ok = self.plan_rover(r, gi)
-
-        self.ax.set_title(
-            f"Executing: Rover {r.id} Gate {r.current_gate} → Gate {gi}" if ok else "No path found. Try again.",
-            color=(0.9,0.9,0.95) if ok else (0.95,0.6,0.6)
-        )
-        self.fig.canvas.draw_idle()
+        self.start_plan_job(r, gi, keep_moving=False)
 
     # ----- animation -----
     def animate(self, _):
         self.frame += 1
+
         for r in self.rovers:
             if r.plan_cd > 0:
                 r.plan_cd -= 1
+            if r.replan_cd > 0:
+                r.replan_cd -= 1
+            if r.yield_cd > 0:
+                r.yield_cd -= 1
+
+        self.poll_plan_jobs()
 
         waiting = self.resolve_traffic()
 
+        # background replan when truly stuck (async, never blocks others)
+        for r in self.rovers:
+            if not (r.moving and r.path):
+                continue
+            if r.goal_gate >= 0 and r.stuck >= REPLAN_TRIGGER and r.replan_cd == 0 and r.plan_future is None:
+                self.start_plan_job(r, r.goal_gate, keep_moving=True)
+                r.replan_cd = REPLAN_COOLDOWN
+
+        # arrivals + autoplan
         for r in self.rovers:
             if not (r.moving and r.path):
                 continue
 
-            # arrival
             if r.idx >= len(r.path) - 1:
                 if self.dock_free(r.goal_gate, r.id):
                     g = self.gates[r.goal_gate]
                     r.state = (float(g.dock[0]), float(g.dock[1]), float(g.heading))
-                    r.trail.append(np.array([r.state[0], r.state[1]], float))
+                    r.trail.append((float(r.state[0]), float(r.state[1])))
+
                     r.previous_gate, r.current_gate = r.current_gate, r.goal_gate
                     r.goal_gate = -1
                     r.path = None
@@ -1013,60 +1230,50 @@ class Sim:
                     r.docked = True
                     r.stuck = 0
                     r.reversing = False
+                    r.force_step = 0
+                    r.yield_cd = 0
 
-                    if self.auto and r.plan_cd == 0:
+                    if self.auto and r.plan_cd == 0 and r.plan_future is None:
                         nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
-                        if nxt >= 0 and (not self.plan_rover(r, nxt)):
+                        if nxt >= 0 and (not self.start_plan_job(r, nxt, keep_moving=False)):
                             r.plan_cd = 30
                 else:
-                    new = self.furthest_dock(r.current_gate, r.goal_gate, r.id)
                     r.goal_gate = -1
                     r.path = None
                     r.moving = False
                     r.reversing = False
-                    if new >= 0 and r.plan_cd == 0:
-                        if not self.plan_rover(r, new):
-                            r.plan_cd = 30
+                    r.force_step = 0
 
-            # stuck fallback: replan occasionally (cooldown prevents spikes)
-            if r.stuck > 140 and r.goal_gate >= 0 and r.plan_cd == 0:
-                r.stuck = 0
-                if not self.plan_rover(r, r.goal_gate):
-                    r.plan_cd = 45
-
-        # auto: retry idle rovers occasionally
         if self.auto:
             for r in self.rovers:
-                if r.docked and not r.moving and r.goal_gate == -1 and r.plan_cd == 0:
+                if r.docked and (not r.moving) and r.goal_gate == -1 and r.plan_cd == 0 and r.plan_future is None:
                     nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
-                    if nxt >= 0 and (not self.plan_rover(r, nxt)):
+                    if nxt >= 0 and (not self.start_plan_job(r, nxt, keep_moving=False)):
                         r.plan_cd = 30
 
         # draw
         for r in self.rovers:
             if r.poly:
                 r.poly.set_xy(square_corners((r.state[0], r.state[1]), r.state[2], S))
-            if r.line and len(r.trail) > 0:
-                t = np.array(r.trail, float)
-                r.line.set_data(t[:,0], t[:,1])
+            if r.line and (self.frame % TRAIL_DRAW_EVERY == 0) and len(r.trail) > 1:
+                xs, ys = zip(*r.trail)
+                r.line.set_data(xs, ys)
 
-        # throttle title updates (big perf win)
-        if self.frame % TITLE_EVERY == 0:
-            moving = sum(1 for r in self.rovers if r.moving)
-            if moving or waiting:
-                self.ax.set_title(("Running" if self.auto else "Manual") + f" | Moving: {moving} | Waiting: {waiting}",
-                                  color=(0.6,0.95,0.6))
-            elif not self.auto:
-                self.ax.set_title(f"Docks: {self.num_docks} | Rovers: {self.num_rovers} | Click gate or press Play",
-                                  color=(0.9,0.9,0.95))
         return []
 
     def run(self):
         self.setup_vis()
         self.reset(BASE_SEED)
         self.ani = FuncAnimation(self.fig, self.animate, interval=FRAME_MS, blit=False)
-        plt.show()
+        try:
+            plt.show()
+        finally:
+            self._shutdown_pool()
 
 
 if __name__ == "__main__":
+    try:
+        mp.set_start_method("spawn", force=True)
+    except Exception:
+        pass
     Sim().run()
