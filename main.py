@@ -1,19 +1,17 @@
+import math, random, heapq
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from collections import deque
+
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.patches import Polygon
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, Slider
-import math, random
-from dataclasses import dataclass
-import heapq
 
-# ============================================================
-# CONFIG
-# ============================================================
+# ===================== CONFIG =====================
 BASE_SEED = 7
 NUM_GATES = 5
-MIN_GATES = 2
-MAX_GATES = 10
 
 S = 1.0
 DEPTH = 2.2 * S
@@ -23,564 +21,394 @@ MIN_GATE_SEP = 2.8 * S
 WORLD_HALFSPAN = 9.0
 BOUND_MARGIN = 1.5 * S
 
-EPS = 2e-3
-
-# Lazy PRM
+# PRM
 PRM_SAMPLES = 900
 PRM_K = 20
 TEMP_K = 28
 A_STAR_EXPANSION_LIMIT = 12000
 
-# Collision sampling
-POS_RES = 0.08
-TH_RES  = 0.12
-
-# Costs
+# costs
 W_TURN = 0.18
-W_REVERSE = 0.05
 
-# Animation
+# animation
 FRAME_MS = 20
 PLAYBACK_SKIP = 2
-COLLISION_BUFFER = 0.1 * S
-ROVER_RADIUS = (S * math.sqrt(2.0)) / 2.0
-COLLISION_DISTANCE = 2.0 * ROVER_RADIUS + COLLISION_BUFFER
 
-# Smoothing controls
-SMOOTH_ENABLED_DEFAULT = True
-SHORTCUT_TRIES = 220          # higher => fewer turns (more checks)
-CHAIKIN_ITERS_MAX = 2         # 0,1,2...
-RESAMPLE_STEP = 0.06          # distance per playback step (controls speed)
-END_LOCK_TOL = 0.08           # tolerance for detecting approach in playback
+# smoothing
+SMOOTH_DEFAULT = True
+SHORTCUT_TRIES = 220
+CHAIKIN_ITERS_MAX = 2
+RESAMPLE_STEP = 0.06
+END_LOCK_TOL = 0.08
 
-# ============================================================
-# BASIC MATH
-# ============================================================
-def max_rovers_for_gates(num_gates):
-    return max(1, num_gates // 2)
+# perf / UI
+TRAIL_MAX = 2500
+TITLE_EVERY = 6
 
-def wrap_angle(a):
-    return (a + np.pi) % (2*np.pi) - np.pi
+# rover collision geometry:
+# wall collision can use slightly-inscribed circle (lets you fit gates tightly)
+ROVER_R_WALL = (S / 2.0) * 0.95
+# rover-rover must use circumscribed circle of square to prevent overlaps
+ROVER_R_ROVER = (math.sqrt(2) / 2.0) * S * 0.99
+ROVER_SEP = 2.0 * ROVER_R_ROVER * 1.03
+ROVER_SEP2 = ROVER_SEP * ROVER_SEP
 
-def rot2(theta):
-    c, s = np.cos(theta), np.sin(theta)
-    return np.array([[c, -s],
-                     [s,  c]])
 
-# ============================================================
-# GEOMETRY (FAST)
-# ============================================================
-def seg_intersect(a, b, c, d):
-    def orient(p, q, r):
-        return (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0])
-    def on_segment(p, q, r):
-        return (min(p[0], r[0]) - 1e-12 <= q[0] <= max(p[0], r[0]) + 1e-12 and
-                min(p[1], r[1]) - 1e-12 <= q[1] <= max(p[1], r[1]) + 1e-12)
+# ===================== MATH / GEOM =====================
 
-    o1 = orient(a, b, c)
-    o2 = orient(a, b, d)
-    o3 = orient(c, d, a)
-    o4 = orient(c, d, b)
+def wrap(a): return (a + np.pi) % (2*np.pi) - np.pi
 
-    if (o1 * o2 < 0) and (o3 * o4 < 0):
-        return True
-    if abs(o1) < 1e-12 and on_segment(a, c, b): return True
-    if abs(o2) < 1e-12 and on_segment(a, d, b): return True
-    if abs(o3) < 1e-12 and on_segment(c, a, d): return True
-    if abs(o4) < 1e-12 and on_segment(c, b, d): return True
-    return False
+def rot2(t):
+    c, s = math.cos(t), math.sin(t)
+    return np.array([[c, -s], [s, c]], float)
 
-def poly_edges(poly):
-    return [(poly[i], poly[(i+1) % len(poly)]) for i in range(len(poly))]
+def square_corners(c, t, side):
+    x, y = c
+    h = side/2.0
+    C, S_ = math.cos(t), math.sin(t)
+    return np.array([
+        [x + (-h)*C - (-h)*S_, y + (-h)*S_ + (-h)*C],
+        [x + ( h)*C - (-h)*S_, y + ( h)*S_ + (-h)*C],
+        [x + ( h)*C - ( h)*S_, y + ( h)*S_ + ( h)*C],
+        [x + (-h)*C - ( h)*S_, y + (-h)*S_ + ( h)*C],
+    ], float)
 
-def square_corners(center, theta, side):
-    c = np.array(center, dtype=float)
-    h = side / 2.0
-    local = np.array([[-h, -h],
-                      [ h, -h],
-                      [ h,  h],
-                      [-h,  h]], dtype=float)
-    R = rot2(theta)
-    return (c + (R @ local.T).T)
+def within(xy, b, m):
+    x, y = float(xy[0]), float(xy[1])
+    xmin, xmax, ymin, ymax = b
+    return xmin+m <= x <= xmax-m and ymin+m <= y <= ymax-m
 
-def point_segment_distance_sq(p, a, b):
-    ap = p - a
-    ab = b - a
+def pt_seg_d2(p, a, b):
+    ap = p-a
+    ab = b-a
     ab2 = float(np.dot(ab, ab))
     if ab2 < 1e-12:
-        d = p - a
-        return float(np.dot(d, d))
-    t = float(np.dot(ap, ab) / ab2)
-    t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
-    proj = a + t * ab
-    d = p - proj
+        return float(np.dot(ap, ap))
+    t = float(np.dot(ap, ab)/ab2)
+    t = 0.0 if t < 0.0 else 1.0 if t > 1.0 else t
+    d = p - (a + t*ab)
     return float(np.dot(d, d))
 
-def point_in_convex_quad(p, quad):
-    x, y = p
-    s = None
-    for i in range(4):
-        x1, y1 = quad[i]
-        x2, y2 = quad[(i+1) % 4]
-        cross = (x2-x1)*(y-y1) - (y2-y1)*(x-x1)
-        if abs(cross) < 1e-12:
-            return False
-        sign = cross > 0
-        if s is None:
-            s = sign
-        elif s != sign:
-            return False
-    return True
+def seg_seg_d2(a, b, c, d):
+    # 2D segment–segment minimum distance squared
+    return min(
+        pt_seg_d2(a, c, d), pt_seg_d2(b, c, d),
+        pt_seg_d2(c, a, b), pt_seg_d2(d, a, b)
+    )
 
-def square_intersects_segment(center, theta, side, s0, s1):
-    sq = square_corners(center, theta, side)
-    if point_in_convex_quad(s0, sq) or point_in_convex_quad(s1, sq):
-        return True
-    for e0, e1 in poly_edges(sq):
-        if seg_intersect(e0, e1, s0, s1):
+def orient(a, b, c):
+    return (b[0]-a[0])*(c[1]-a[1]) - (b[1]-a[1])*(c[0]-a[0])
+
+def on_seg(a, b, p, eps=1e-12):
+    return (min(a[0], b[0])-eps <= p[0] <= max(a[0], b[0])+eps and
+            min(a[1], b[1])-eps <= p[1] <= max(a[1], b[1])+eps)
+
+def seg_intersect(a, b, c, d, eps=1e-12):
+    o1, o2, o3, o4 = orient(a, b, c), orient(a, b, d), orient(c, d, a), orient(c, d, b)
+    if abs(o1) <= eps and on_seg(a, b, c): return True
+    if abs(o2) <= eps and on_seg(a, b, d): return True
+    if abs(o3) <= eps and on_seg(c, d, a): return True
+    if abs(o4) <= eps and on_seg(c, d, b): return True
+    return (o1*o2 < 0) and (o3*o4 < 0)
+
+
+# ===================== WALL INDEX =====================
+class WallIndex:
+    def __init__(self, walls=None):
+        self.set(walls or [])
+
+    def set(self, walls):
+        self.walls = walls
+        self.p0 = np.array([w[0] for w in walls], float) if walls else np.zeros((0,2), float)
+        self.p1 = np.array([w[1] for w in walls], float) if walls else np.zeros((0,2), float)
+        self.d = self.p1 - self.p0
+        self.len2 = np.sum(self.d*self.d, axis=1) if walls else np.zeros((0,), float)
+        self.len2[self.len2 < 1e-12] = 1e-12
+
+    def _min_d2_pts(self, pts):
+        if self.p0.shape[0] == 0:
+            return np.full((len(pts),), np.inf, float)
+        ap = pts[:,None,:] - self.p0[None,:,:]
+        t = np.sum(ap * self.d[None,:,:], axis=2) / self.len2[None,:]
+        t = np.clip(t, 0.0, 1.0)[:,:,None]
+        closest = self.p0[None,:,:] + t * self.d[None,:,:]
+        diff = pts[:,None,:] - closest
+        return np.min(np.sum(diff*diff, axis=2), axis=1)
+
+    def collides_pose(self, x, y, bounds, margin, r=ROVER_R_WALL):
+        if not within((x, y), bounds, margin):
             return True
-    return False
+        return self._min_d2_pts(np.array([[x, y]], float))[0] < r*r
 
-def square_collides_walls(center, theta, side, walls, eps=EPS):
-    side_eff = max(1e-6, side - 2.0*eps)
-    c = np.array(center, dtype=float)
-    r = (side_eff / 2.0) * math.sqrt(2.0)
-    r2 = r * r
-    for (w0, w1) in walls:
-        if point_segment_distance_sq(c, w0, w1) > r2:
-            continue
-        if square_intersects_segment(c, theta, side_eff, w0, w1):
+    def collides_seg(self, a_xy, b_xy, bounds, margin, r=ROVER_R_WALL):
+        a = np.array(a_xy, float)
+        b = np.array(b_xy, float)
+        if not within(a, bounds, margin) or not within(b, bounds, margin):
             return True
-    return False
+        rr = r*r
+        for w0, w1 in self.walls:
+            c = np.array(w0, float); d = np.array(w1, float)
+            if seg_intersect(a, b, c, d):
+                return True
+            if min(pt_seg_d2(a, c, d), pt_seg_d2(b, c, d),
+                   pt_seg_d2(c, a, b), pt_seg_d2(d, a, b)) < rr:
+                return True
+        return False
 
-def within_bounds(center, bounds, margin):
-    x, y = center
-    xmin, xmax, ymin, ymax = bounds
-    return (xmin + margin <= x <= xmax - margin) and (ymin + margin <= y <= ymax - margin)
 
-# ============================================================
-# GATE
-# ============================================================
+# ===================== GATE + ROVER =====================
 @dataclass
 class Gate:
     center: np.ndarray
     theta: float
-    s: float
-    depth: float
+    s: float = S
+    depth: float = DEPTH
 
-    def local_to_world(self, xy):
-        return self.center + rot2(self.theta) @ xy
+    walls: List[Tuple[np.ndarray, np.ndarray]] = field(init=False)
+    open_p1: np.ndarray = field(init=False)
+    open_p2: np.ndarray = field(init=False)
+    dock: np.ndarray = field(init=False)
+    approach: np.ndarray = field(init=False)
+    heading: float = field(init=False)
 
-    def inward_normal_world(self):
-        return rot2(self.theta) @ np.array([0.0, 1.0])
+    def __post_init__(self):
+        R = rot2(self.theta)
+        c = self.center
+        s = self.s
+        d = self.depth
 
-    def opening_endpoints_world(self):
-        p1 = self.local_to_world(np.array([-self.s/2, 0.0]))
-        p2 = self.local_to_world(np.array([ self.s/2, 0.0]))
-        return p1, p2
+        self.open_p1 = c + R @ np.array([-s/2, 0.0])
+        self.open_p2 = c + R @ np.array([ s/2, 0.0])
 
-    def walls_world(self):
-        L0 = self.local_to_world(np.array([-self.s/2, 0.0]))
-        L1 = self.local_to_world(np.array([-self.s/2, self.depth]))
-        R0 = self.local_to_world(np.array([ self.s/2, 0.0]))
-        R1 = self.local_to_world(np.array([ self.s/2, self.depth]))
-        B0 = self.local_to_world(np.array([-self.s/2, self.depth]))
-        B1 = self.local_to_world(np.array([ self.s/2, self.depth]))
-        return [(L0, L1), (R0, R1), (B0, B1)]
+        n = R @ np.array([0.0, 1.0])
+        self.heading = math.atan2(n[1], n[0])
 
-    def required_heading(self):
-        n = self.inward_normal_world()
-        return math.atan2(n[1], n[0])
+        mid = 0.5 * (self.open_p1 + self.open_p2)
+        self.dock = mid + (s/2) * n
+        self.approach = self.dock - APPROACH_L * n
 
-    def dock_center(self):
-        p1, p2 = self.opening_endpoints_world()
-        m = 0.5*(p1+p2)
-        n = self.inward_normal_world()
-        return m + (self.s/2)*n
+        L0 = c + R @ np.array([-s/2, 0.0]); L1 = c + R @ np.array([-s/2, d])
+        R0 = c + R @ np.array([ s/2, 0.0]); R1 = c + R @ np.array([ s/2, d])
+        B0 = c + R @ np.array([-s/2, d]);  B1 = c + R @ np.array([ s/2, d])
+        self.walls = [(L0, L1), (R0, R1), (B0, B1)]
 
-    def approach_center(self, L):
-        n = self.inward_normal_world()
-        return self.dock_center() - L*n
 
-# ============================================================
-# MOTION + COLLISION SAMPLING
-# ============================================================
-def rotate_in_place_free(x, y, th0, th1, side, walls, bounds, margin, th_res=TH_RES):
-    if not within_bounds((x, y), bounds, margin):
-        return False
-    d = wrap_angle(th1 - th0)
-    steps = max(2, int(abs(d) / th_res) + 1)
-    for i in range(steps + 1):
-        t = i / steps
-        th = wrap_angle(th0 + t * d)
-        if square_collides_walls((x, y), th, side, walls):
-            return False
-    return True
+@dataclass
+class Rover:
+    id: int
+    current_gate: int
+    previous_gate: int
+    state: Tuple[float, float, float]
 
-def drive_straight_free(x0, y0, x1, y1, th, side, walls, bounds, margin, pos_res=POS_RES):
-    dx, dy = x1 - x0, y1 - y0
-    dist = math.hypot(dx, dy)
-    steps = max(2, int(dist / pos_res) + 1)
-    for i in range(steps + 1):
-        t = i / steps
-        x = x0 + t * dx
-        y = y0 + t * dy
-        if not within_bounds((x, y), bounds, margin):
-            return False
-        if square_collides_walls((x, y), th, side, walls):
-            return False
-    return True
+    goal_gate: int = -1
+    path: Optional[List[Tuple[float, float, float]]] = None
+    idx: int = 0
+    moving: bool = False
+    docked: bool = True
 
-def se2_edge_free_with_reverse(a, b, side, walls, bounds, margin):
-    ax, ay, ath = a
-    bx, by, bth = b
-    dx, dy = bx - ax, by - ay
-    dist2 = dx*dx + dy*dy
-    if dist2 < 1e-12:
-        return rotate_in_place_free(ax, ay, ath, bth, side, walls, bounds, margin), False
+    stuck: int = 0
+    reversing: bool = False
+    reverse_target: int = 0
+    blocked_by: int = -1
 
-    travel = math.atan2(dy, dx)
+    plan_cd: int = 0  # cooldown frames to avoid replan spikes
 
-    okA = (rotate_in_place_free(ax, ay, ath, travel, side, walls, bounds, margin) and
-           drive_straight_free(ax, ay, bx, by, travel, side, walls, bounds, margin) and
-           rotate_in_place_free(bx, by, travel, bth, side, walls, bounds, margin))
+    trail: deque = field(default_factory=lambda: deque(maxlen=TRAIL_MAX))
 
-    travel_rev = wrap_angle(travel + np.pi)
-    okB = (rotate_in_place_free(ax, ay, ath, travel_rev, side, walls, bounds, margin) and
-           drive_straight_free(ax, ay, bx, by, travel_rev, side, walls, bounds, margin) and
-           rotate_in_place_free(bx, by, travel_rev, bth, side, walls, bounds, margin))
+    poly: Optional[Polygon] = None
+    line: Optional[object] = None
 
-    if okA:
-        return True, False
-    if okB:
-        return True, True
-    return False, False
 
-def se2_edge_cost(a, b, used_reverse=False):
+# ===================== PRM / PATH =====================
+
+def knn_lists(nodes, k):
+    xy = np.array([(n[0], n[1]) for n in nodes], float)
+    N = len(nodes)
+    out = []
+    for i in range(N):
+        d2 = np.sum((xy - xy[i])**2, axis=1)
+        idx = np.argpartition(d2, k+1)[:k+1]
+        idx = idx[np.argsort(d2[idx])]
+        out.append([j for j in idx if j != i][:k])
+    return out
+
+def knn_temp(pose, base_nodes, k):
+    xy = np.array([(n[0], n[1]) for n in base_nodes], float)
+    x, y, _ = pose
+    d2 = np.sum((xy - np.array([x, y]))**2, axis=1)
+    idx = np.argpartition(d2, k)[:k]
+    return idx[np.argsort(d2[idx])].tolist()
+
+def se2_cost(a, b):
     ax, ay, ath = a
     bx, by, bth = b
     dist = math.hypot(bx-ax, by-ay)
     if dist < 1e-12:
-        return W_TURN * abs(wrap_angle(bth-ath))
-    travel = math.atan2(by-ay, bx-ax)
-    if used_reverse:
-        travel = wrap_angle(travel + np.pi)
-    turn = abs(wrap_angle(travel - ath)) + abs(wrap_angle(bth - travel))
-    return dist + W_TURN * turn + (W_REVERSE if used_reverse else 0.0)
+        return W_TURN * abs(wrap(bth-ath))
+    tr = math.atan2(by-ay, bx-ax)
+    return dist + W_TURN * (abs(wrap(tr-ath)) + abs(wrap(bth-tr)))
 
-def densify_edge(a, b, used_reverse=False, ds=0.06, dth=0.12):
+def densify_edge(a, b, ds=RESAMPLE_STEP, dth=0.12):
     ax, ay, ath = a
     bx, by, bth = b
-    out = [(ax, ay, ath)]
     dx, dy = bx-ax, by-ay
     dist = math.hypot(dx, dy)
+    out = [(ax, ay, ath)]
 
     if dist < 1e-12:
-        d = wrap_angle(bth-ath)
+        d = wrap(bth-ath)
         n = max(1, int(abs(d)/dth))
-        for i in range(1, n+1):
-            t = i/n
-            out.append((ax, ay, wrap_angle(ath + t*d)))
-        return out
+        return out + [(ax, ay, wrap(ath + (i/n)*d)) for i in range(1, n+1)]
 
-    travel = math.atan2(dy, dx)
-    if used_reverse:
-        travel = wrap_angle(travel + np.pi)
-
-    d0 = wrap_angle(travel - ath)
-    n0 = max(1, int(abs(d0)/dth))
-    for i in range(1, n0+1):
-        t = i/n0
-        out.append((ax, ay, wrap_angle(ath + t*d0)))
+    tr = math.atan2(dy, dx)
+    d0 = wrap(tr-ath); n0 = max(1, int(abs(d0)/dth))
+    out += [(ax, ay, wrap(ath + (i/n0)*d0)) for i in range(1, n0+1)]
 
     n1 = max(1, int(dist/ds))
-    for i in range(1, n1+1):
-        t = i/n1
-        out.append((ax + t*dx, ay + t*dy, travel))
+    out += [(ax + (i/n1)*dx, ay + (i/n1)*dy, tr) for i in range(1, n1+1)]
 
-    d2 = wrap_angle(bth - travel)
-    n2 = max(1, int(abs(d2)/dth))
-    for i in range(1, n2+1):
-        t = i/n2
-        out.append((bx, by, wrap_angle(travel + t*d2)))
-
+    d2 = wrap(bth-tr); n2 = max(1, int(abs(d2)/dth))
+    out += [(bx, by, wrap(tr + (i/n2)*d2)) for i in range(1, n2+1)]
     return out
 
-def densify_straight_pose(a_xy, b_xy, th, ds=0.05):
+def densify_straight(a_xy, b_xy, th, ds=0.05):
     ax, ay = a_xy
     bx, by = b_xy
     dx, dy = bx-ax, by-ay
     dist = math.hypot(dx, dy)
     n = max(1, int(dist/ds))
-    out = []
-    for i in range(n+1):
-        t = i/n
-        out.append((ax + t*dx, ay + t*dy, th))
-    return out
+    return [(ax + (i/n)*dx, ay + (i/n)*dy, th) for i in range(n+1)]
 
-# ============================================================
-# WORLD GENERATION (DOCKABLE)
-# ============================================================
-def generate_world(num_gates, seed):
-    rng_np = np.random.default_rng(seed)
-    bounds = (-WORLD_HALFSPAN, WORLD_HALFSPAN, -WORLD_HALFSPAN, WORLD_HALFSPAN)
-
-    gates = []
-    tries = 0
-    while len(gates) < num_gates and tries < 50000:
-        tries += 1
-        center = rng_np.uniform(-0.7*WORLD_HALFSPAN, 0.7*WORLD_HALFSPAN, size=2)
-        theta = rng_np.uniform(-np.pi, np.pi)
-        g = Gate(center=center, theta=theta, s=S, depth=DEPTH)
-
-        if any(np.linalg.norm(g.center - gg.center) < MIN_GATE_SEP for gg in gates):
-            continue
-
-        other_walls = []
-        for gg in gates:
-            other_walls.extend(gg.walls_world())
-
-        dock = g.dock_center()
-        app  = g.approach_center(APPROACH_L)
-        th   = g.required_heading()
-
-        if not within_bounds(dock, bounds, BOUND_MARGIN): continue
-        if not within_bounds(app,  bounds, BOUND_MARGIN): continue
-
-        if square_collides_walls(dock, th, S, other_walls): continue
-        if square_collides_walls(app,  th, S, other_walls): continue
-
-        gw = g.walls_world()
-        if square_collides_walls(dock, th, S, gw): continue
-        if square_collides_walls(app,  th, S, gw): continue
-
-        # docking & undocking must work as straight segments
-        if not drive_straight_free(app[0], app[1], dock[0], dock[1], th, S, gw, bounds, BOUND_MARGIN):
-            continue
-        if not drive_straight_free(dock[0], dock[1], app[0], app[1], th, S, gw, bounds, BOUND_MARGIN):
-            continue
-
-        gates.append(g)
-
-    if len(gates) < num_gates:
-        raise RuntimeError("Failed to generate a dockable world. Try WORLD_HALFSPAN bigger or MIN_GATE_SEP smaller.")
-
-    walls = []
-    for g in gates:
-        walls.extend(g.walls_world())
-    return gates, walls, bounds
-
-# ============================================================
-# LAZY PRM
-# ============================================================
-def build_knn_lists(nodes, k):
-    xy = np.array([[n[0], n[1]] for n in nodes], dtype=float)
-    N = len(nodes)
-    nbrs = []
-    for i in range(N):
-        d = np.linalg.norm(xy - xy[i], axis=1)
-        idx = np.argsort(d)
-        nbrs.append([j for j in idx[1:k+1]])
-    return nbrs
-
-def connect_temp_neighbors(temp_state, base_nodes, k_temp):
-    xy = np.array([[n[0], n[1]] for n in base_nodes], dtype=float)
-    tx, ty, _ = temp_state
-    d = np.linalg.norm(xy - np.array([tx, ty]), axis=1)
-    idx = np.argsort(d)[:k_temp]
-    return list(idx)
-
-def astar_lazy(nodes, nbrs, start_idx, goal_idx, edge_free_fn, edge_cost_fn, expansion_limit=A_STAR_EXPANSION_LIMIT):
+def astar_lazy(nodes, nbrs, s_idx, g_idx, edge_ok, edge_cost, limit=A_STAR_EXPANSION_LIMIT):
+    gx, gy, _ = nodes[g_idx]
     def h(i):
         x, y, _ = nodes[i]
-        gx, gy, _ = nodes[goal_idx]
         return math.hypot(gx-x, gy-y)
 
-    edge_cache = {}  # (min,max) -> (ok, used_reverse)
+    cache = {}
+    def ok(i, j):
+        a, b = (i, j) if i < j else (j, i)
+        if (a, b) in cache:
+            return cache[(a, b)]
+        v = edge_ok(nodes[i], nodes[j])
+        cache[(a, b)] = v
+        return v
 
-    def edge_eval(i, j):
-        a = i if i < j else j
-        b = j if i < j else i
-        key = (a, b)
-        if key in edge_cache:
-            return edge_cache[key]
-        ok, used_rev = edge_free_fn(nodes[i], nodes[j])
-        edge_cache[key] = (ok, used_rev)
-        return ok, used_rev
-
-    pq = []
-    heapq.heappush(pq, (h(start_idx), 0.0, start_idx, -1))
+    pq = [(h(s_idx), 0.0, s_idx, -1)]
     came = {}
-    gbest = {start_idx: 0.0}
+    gbest = {s_idx: 0.0}
     closed = set()
-    expansions = 0
+    exp = 0
 
     while pq:
-        f, g, u, parent = heapq.heappop(pq)
+        _, g, u, p = heapq.heappop(pq)
         if u in closed:
             continue
         closed.add(u)
-        came[u] = parent
+        came[u] = p
 
-        if u == goal_idx:
-            idx_path = []
+        if u == g_idx:
+            path = []
             cur = u
             while cur != -1:
-                idx_path.append(cur)
+                path.append(cur)
                 cur = came[cur]
-            idx_path.reverse()
+            return path[::-1]
 
-            rev_flags = []
-            for a_i, b_i in zip(idx_path[:-1], idx_path[1:]):
-                ok, used_rev = edge_eval(a_i, b_i)
-                rev_flags.append(used_rev)
-            return idx_path, rev_flags
-
-        expansions += 1
-        if expansions > expansion_limit:
+        exp += 1
+        if exp > limit:
             return None
 
         for v in nbrs[u]:
-            if v in closed:
+            if v in closed or not ok(u, v):
                 continue
-            ok, used_rev = edge_eval(u, v)
-            if not ok:
-                continue
-            w = edge_cost_fn(nodes[u], nodes[v], used_rev)
-            ng = g + w
-            if (v not in gbest) or (ng < gbest[v] - 1e-9):
+            ng = g + edge_cost(nodes[u], nodes[v])
+            if v not in gbest or ng < gbest[v] - 1e-9:
                 gbest[v] = ng
                 heapq.heappush(pq, (ng + h(v), ng, v, u))
-
     return None
 
-# ============================================================
-# PATH SMOOTHING (shortcut + Chaikin + constant speed)
-# ============================================================
-def unique_xy(points, tol=1e-6):
+
+# ===================== SMOOTHING =====================
+
+def uniq_xy(states, tol=1e-6):
     out = []
     last = None
-    for p in points:
-        if last is None or (abs(p[0]-last[0]) > tol or abs(p[1]-last[1]) > tol):
-            out.append(np.array([p[0], p[1]], dtype=float))
-            last = p
+    for x, y, _ in states:
+        if last is None or abs(x-last[0]) > tol or abs(y-last[1]) > tol:
+            out.append(np.array([x, y], float))
+            last = (x, y)
     return out
 
-def chaikin(points_xy, iters):
-    # Chaikin corner cutting on open polyline
-    pts = [np.array(p, dtype=float) for p in points_xy]
+def chaikin(pts, iters):
+    pts = [np.array(p, float) for p in pts]
     for _ in range(iters):
         if len(pts) < 3:
             return pts
-        new_pts = [pts[0]]
+        n = [pts[0]]
         for i in range(len(pts)-1):
-            p = pts[i]
-            q = pts[i+1]
-            Q = 0.75*p + 0.25*q
-            R = 0.25*p + 0.75*q
-            new_pts.extend([Q, R])
-        new_pts[-1] = pts[-1]
-        pts = new_pts
+            p, q = pts[i], pts[i+1]
+            n += [0.75*p + 0.25*q, 0.25*p + 0.75*q]
+        n[-1] = pts[-1]
+        pts = n
     return pts
 
-def resample_polyline(points_xy, step):
-    pts = [np.array(p, dtype=float) for p in points_xy]
+def resample(pts, step):
+    pts = [np.array(p, float) for p in pts]
     if len(pts) < 2:
         return pts
-
-    # cumulative arc length
-    segs = [np.linalg.norm(pts[i+1]-pts[i]) for i in range(len(pts)-1)]
-    L = float(np.sum(segs))
+    seg = [np.linalg.norm(pts[i+1]-pts[i]) for i in range(len(pts)-1)]
+    L = float(np.sum(seg))
     if L < 1e-9:
         return [pts[0]]
-
-    n = max(2, int(L/step) + 1)
+    n = max(2, int(L/step)+1)
     targets = np.linspace(0.0, L, n)
 
     out = [pts[0]]
-    cur_seg = 0
-    cur_s = 0.0
+    cur = 0
+    s = 0.0
     for tL in targets[1:]:
-        while cur_seg < len(segs) and (cur_s + segs[cur_seg]) < tL - 1e-12:
-            cur_s += segs[cur_seg]
-            cur_seg += 1
-        if cur_seg >= len(segs):
+        while cur < len(seg) and s + seg[cur] < tL - 1e-12:
+            s += seg[cur]
+            cur += 1
+        if cur >= len(seg):
             out.append(pts[-1])
             continue
-        a = pts[cur_seg]
-        b = pts[cur_seg+1]
-        segL = segs[cur_seg]
-        if segL < 1e-12:
-            out.append(a.copy())
-            continue
-        u = (tL - cur_s) / segL
-        out.append(a + u*(b-a))
+        a, b = pts[cur], pts[cur+1]
+        Ls = seg[cur]
+        out.append(a if Ls < 1e-12 else a + ((tL-s)/Ls) * (b-a))
     return out
 
-def tangent_headings(resampled_xy, th_start=None, th_end=None):
-    xy = [np.array(p, dtype=float) for p in resampled_xy]
-    n = len(xy)
+def tan_heads(pts, th0=None, th1=None):
+    pts = [np.array(p, float) for p in pts]
+    n = len(pts)
     th = []
     for i in range(n):
-        if i == n-1:
-            v = xy[i] - xy[i-1]
-        else:
-            v = xy[i+1] - xy[i]
-        ang = math.atan2(v[1], v[0]) if np.linalg.norm(v) > 1e-12 else (th[-1] if th else 0.0)
+        v = pts[i] - pts[i-1] if i == n-1 else pts[i+1] - pts[i]
+        ang = math.atan2(v[1], v[0]) if float(np.dot(v, v)) > 1e-12 else (th[-1] if th else 0.0)
         th.append(ang)
-
-    # softly lock endpoints (to match approach headings)
-    if th_start is not None:
-        th[0] = th_start
+    if th0 is not None:
+        th[0] = th0
         if n > 1:
-            th[1] = wrap_angle(0.7*th[1] + 0.3*th_start)
-    if th_end is not None:
-        th[-1] = th_end
+            th[1] = wrap(0.7*th[1] + 0.3*th0)
+    if th1 is not None:
+        th[-1] = th1
         if n > 1:
-            th[-2] = wrap_angle(0.7*th[-2] + 0.3*th_end)
+            th[-2] = wrap(0.7*th[-2] + 0.3*th1)
     return th
 
-def validate_states(states, walls, bounds, margin):
-    for x, y, th in states:
-        if not within_bounds((x, y), bounds, margin):
-            return False
-        if square_collides_walls((x, y), th, S, walls):
+def validate(states, WI, bounds, margin):
+    for x, y, _ in states:
+        if WI.collides_pose(x, y, bounds, margin):
             return False
     return True
 
-def smooth_free_segment(raw_states, th_start, th_end, walls, bounds, margin):
-    """
-    raw_states: list[(x,y,th)] for the middle free-space portion.
-    Returns smoothed states with approx constant spatial step, or None.
-    """
-    raw_xy = unique_xy([(s[0], s[1]) for s in raw_states])
-    if len(raw_xy) < 3:
-        # no point smoothing
-        out = [(p[0], p[1], th_start) for p in raw_xy]
-        return out
-
-    for iters in range(CHAIKIN_ITERS_MAX, -1, -1):
-        pts = chaikin(raw_xy, iters)
-        pts = resample_polyline(pts, RESAMPLE_STEP)
-        ths = tangent_headings(pts, th_start=th_start, th_end=th_end)
-        states = [(float(p[0]), float(p[1]), float(ths[i])) for i, p in enumerate(pts)]
-        if validate_states(states, walls, bounds, margin):
-            return states
-    return None
-
-def shortcut_path(states, walls, bounds, margin, tries=SHORTCUT_TRIES):
-    """
-    Shortcut the free-space portion using our exact edge checker (rotate/drive/reverse),
-    then densify again.
-    """
+def shortcut(states, WI, bounds, margin, tries=SHORTCUT_TRIES):
     if len(states) < 4:
         return states
-
-    # pick "key poses" sparsely: use every ~6th point to reduce overhead
     key = states[::6]
-    if np.linalg.norm(np.array([states[-1][0],states[-1][1]]) - np.array([key[-1][0],key[-1][1]])) > 1e-9:
+    if (key[-1][0]-states[-1][0])**2 + (key[-1][1]-states[-1][1])**2 > 1e-12:
         key.append(states[-1])
-
     key = [(k[0], k[1], k[2]) for k in key]
 
     for _ in range(tries):
@@ -588,656 +416,657 @@ def shortcut_path(states, walls, bounds, margin, tries=SHORTCUT_TRIES):
             break
         i = random.randint(0, len(key)-3)
         j = random.randint(i+2, len(key)-1)
-        a = key[i]
-        b = key[j]
-        ok, used_rev = se2_edge_free_with_reverse(a, b, S, walls, bounds, margin)
-        if not ok:
+        a, b = key[i], key[j]
+        if WI.collides_seg((a[0], a[1]), (b[0], b[1]), bounds, margin):
             continue
-        # if valid, remove intermediate nodes i+1..j-1
         key = key[:i+1] + key[j:]
 
-    # densify the shortcut keypath into a new state list
     out = []
     for a, b in zip(key[:-1], key[1:]):
-        ok, used_rev = se2_edge_free_with_reverse(a, b, S, walls, bounds, margin)
-        if not ok:
-            # fallback: if shortcut produced something inconsistent, just bail out
+        if WI.collides_seg((a[0], a[1]), (b[0], b[1]), bounds, margin):
             return states
-        seg = densify_edge(a, b, used_reverse=used_rev, ds=0.06, dth=0.12)
-        if out:
-            out.extend(seg[1:])
-        else:
-            out.extend(seg)
+        seg = densify_edge(a, b)
+        out += seg[1:] if out else seg
     return out
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
-world_seed = BASE_SEED
-num_rovers = max_rovers_for_gates(NUM_GATES)
-gates = []
-all_walls = []
-WORLD_BOUNDS = None
-A_pts = []
-D_pts = []
-H_req = []
+def smooth_mid(playback, cur_gate, goal_gate, gates, WI, bounds, margin, enabled):
+    if (not enabled) or len(playback) < 12:
+        return playback
 
-nodes = []
-nbrs = []
+    cur_app = gates[cur_gate].approach
+    goal_app = gates[goal_gate].approach
+    th0 = gates[cur_gate].heading
+    th1 = gates[goal_gate].heading
 
-rover_current_gates = []
-rover_last_gates = []
-rover_docked = []
-rover_states = []
-rover_executed_xy = []
-rover_plans = []
-rover_play_idx = []
-rover_moving = []
-rover_goal_gates = []
-rover_intersection_constraints = []
-playing = False
-intersections_dirty = True
+    end_u = next((i for i, (x, y, _) in enumerate(playback)
+                  if (x-cur_app[0])**2 + (y-cur_app[1])**2 < END_LOCK_TOL**2), None)
+    start_d = next((i for i in range(len(playback)-1, -1, -1)
+                    if (playback[i][0]-goal_app[0])**2 + (playback[i][1]-goal_app[1])**2 < END_LOCK_TOL**2), None)
 
-gate_artists = []
-rover_artists = []
-rover_trails = []
-rover_plan_lines = []
-smooth_enabled = SMOOTH_ENABLED_DEFAULT
+    if end_u is None or start_d is None or start_d <= end_u + 5:
+        return playback
 
-gate_colors = [
-    (0.2, 0.7, 0.9),
-    (0.9, 0.55, 0.2),
-    (0.55, 0.9, 0.35),
-    (0.85, 0.35, 0.75),
-    (0.95, 0.9, 0.25),
-]
+    pre = playback[:end_u+1]
+    mid = playback[end_u:start_d+1]
+    suf = playback[start_d:]
 
-rover_colors = [
-    (0.92, 0.92, 0.95),
-    (0.9, 0.6, 0.65),
-    (0.55, 0.85, 0.75),
-    (0.85, 0.75, 0.45),
-    (0.65, 0.7, 0.95),
-]
+    mid2 = shortcut(mid, WI, bounds, margin)
+    raw = uniq_xy(mid2)
+    if len(raw) < 3:
+        return playback
 
-# ============================================================
-# PLANNING
-# ============================================================
-def build_prm_for_current_world(seed):
-    rng = np.random.default_rng(seed + 12345)
-    xmin, xmax, ymin, ymax = WORLD_BOUNDS
-
-    local_nodes = []
-    while len(local_nodes) < PRM_SAMPLES:
-        x = rng.uniform(xmin + BOUND_MARGIN, xmax - BOUND_MARGIN)
-        y = rng.uniform(ymin + BOUND_MARGIN, ymax - BOUND_MARGIN)
-        th = rng.uniform(-np.pi, np.pi)
-        if square_collides_walls((x, y), th, S, all_walls):
-            continue
-        local_nodes.append((x, y, th))
-
-    # add approach poses as landmarks
-    for i in range(NUM_GATES):
-        local_nodes.append((A_pts[i][0], A_pts[i][1], H_req[i]))
-
-    local_nbrs = build_knn_lists(local_nodes, PRM_K)
-    return local_nodes, local_nbrs
-
-def plan_free_space(start_pose, goal_pose):
-    tmp_nodes = nodes + [start_pose, goal_pose]
-    start_idx = len(tmp_nodes) - 2
-    goal_idx  = len(tmp_nodes) - 1
-
-    tmp_nbrs = [list(lst) for lst in nbrs] + [[], []]
-
-    start_neighbors = connect_temp_neighbors(start_pose, nodes, TEMP_K)
-    goal_neighbors  = connect_temp_neighbors(goal_pose, nodes, TEMP_K)
-
-    tmp_nbrs[start_idx] = start_neighbors
-    tmp_nbrs[goal_idx]  = goal_neighbors
-
-    for j in start_neighbors:
-        tmp_nbrs[j] = list(set(tmp_nbrs[j] + [start_idx]))
-    for j in goal_neighbors:
-        tmp_nbrs[j] = list(set(tmp_nbrs[j] + [goal_idx]))
-
-    def edge_free(a, b):
-        return se2_edge_free_with_reverse(a, b, S, all_walls, WORLD_BOUNDS, BOUND_MARGIN)
-
-    result = astar_lazy(
-        tmp_nodes, tmp_nbrs,
-        start_idx, goal_idx,
-        edge_free_fn=edge_free,
-        edge_cost_fn=se2_edge_cost
-    )
-    if result is None:
-        return None
-
-    idx_path, rev_flags = result
-
-    playback = []
-    for (a_i, b_i), used_rev in zip(zip(idx_path[:-1], idx_path[1:]), rev_flags):
-        a = tmp_nodes[a_i]
-        b = tmp_nodes[b_i]
-        seg = densify_edge(a, b, used_reverse=used_rev, ds=0.06, dth=0.12)
-        if playback:
-            playback.extend(seg[1:])
-        else:
-            playback.extend(seg)
+    for it in range(CHAIKIN_ITERS_MAX, -1, -1):
+        pts = resample(chaikin(raw, it), RESAMPLE_STEP)
+        th = tan_heads(pts, th0, th1)
+        sm = [(float(p[0]), float(p[1]), float(th[i])) for i, p in enumerate(pts)]
+        out = pre[:-1] + sm + suf[1:]
+        if validate(out, WI, bounds, margin):
+            return out
     return playback
 
-def smooth_playback(full_playback, cur_gate, goal_gate_idx):
-    """
-    Keep UNDock and Dock rigid.
-    Smooth only the middle free-space segment.
-    """
-    if not smooth_enabled:
-        return full_playback
 
-    cur_app = A_pts[cur_gate]
-    goal_app = A_pts[goal_gate_idx]
-    cur_th = H_req[cur_gate]
-    goal_th = H_req[goal_gate_idx]
-
-    # find first index near cur_app (end of undock)
-    end_undock = None
-    for i, (x,y,th) in enumerate(full_playback):
-        if (x-cur_app[0])**2 + (y-cur_app[1])**2 < END_LOCK_TOL**2:
-            end_undock = i
-            break
-    # find last index near goal_app (start of dock)
-    start_dock = None
-    for i in range(len(full_playback)-1, -1, -1):
-        x,y,th = full_playback[i]
-        if (x-goal_app[0])**2 + (y-goal_app[1])**2 < END_LOCK_TOL**2:
-            start_dock = i
-            break
-
-    if end_undock is None or start_dock is None or start_dock <= end_undock + 5:
-        return full_playback
-
-    prefix = full_playback[:end_undock+1]
-    middle = full_playback[end_undock:start_dock+1]
-    suffix = full_playback[start_dock:]
-
-    # 1) shortcut middle to reduce stop/go
-    middle2 = shortcut_path(middle, all_walls, WORLD_BOUNDS, BOUND_MARGIN, tries=SHORTCUT_TRIES)
-
-    # 2) smooth XY and constant-speed resample; compute tangent headings
-    sm = smooth_free_segment(middle2, th_start=cur_th, th_end=goal_th,
-                             walls=all_walls, bounds=WORLD_BOUNDS, margin=BOUND_MARGIN)
-    if sm is None:
-        return full_playback
-
-    # stitch, ensuring continuity without duplicate points
-    out = prefix[:-1] + sm + suffix[1:]
-    if not validate_states(out, all_walls, WORLD_BOUNDS, BOUND_MARGIN):
-        return full_playback
-    return out
-
-def plan_to_gate(rover_idx, goal_gate_idx):
-    cur = rover_current_gates[rover_idx]
-    cur_th = H_req[cur]
-    cur_dock = D_pts[cur]
-    cur_app = A_pts[cur]
-
-    goal_th = H_req[goal_gate_idx]
-    goal_dock = D_pts[goal_gate_idx]
-    goal_app = A_pts[goal_gate_idx]
-
-    playback = []
-
-    # UNDock
-    if rover_docked[rover_idx]:
-        undock = densify_straight_pose((cur_dock[0], cur_dock[1]), (cur_app[0], cur_app[1]), cur_th, ds=0.05)
-        for x, y, th in undock:
-            if square_collides_walls((x, y), th, S, all_walls):
-                return None
-        playback.extend(undock)
-        start_pose = (cur_app[0], cur_app[1], cur_th)
-    else:
-        start_pose = rover_states[rover_idx]
-
-    # Free-space plan approach->approach
-    goal_pose = (goal_app[0], goal_app[1], goal_th)
-    free_path = plan_free_space(start_pose, goal_pose)
-    if free_path is None:
-        return None
-    playback.extend(free_path[1:])  # connect
-
-    # Dock straight
-    dock = densify_straight_pose((goal_app[0], goal_app[1]), (goal_dock[0], goal_dock[1]), goal_th, ds=0.05)
-    for x, y, th in dock:
-        if square_collides_walls((x, y), th, S, all_walls):
-            return None
-    playback.extend(dock[1:])
-
-    # Smooth + constant-speed in the free-space segment
-    playback2 = smooth_playback(playback, cur_gate=cur, goal_gate_idx=goal_gate_idx)
-    return playback2
-
-# ============================================================
-# FIGURE / UI
-# ============================================================
-fig, ax = plt.subplots(figsize=(9.5, 9.5))
-plt.subplots_adjust(bottom=0.14, right=0.82)
-
-ax.set_aspect("equal", "box")
-ax.set_facecolor((0.06, 0.07, 0.09))
-fig.patch.set_facecolor((0.06, 0.07, 0.09))
-for spine in ax.spines.values():
-    spine.set_color((0.35, 0.35, 0.4))
-ax.tick_params(colors=(0.75, 0.75, 0.8))
-ax.grid(True, alpha=0.12)
-
-# rover artists are initialized in reset_rovers()
-
-# Buttons
-btn_ax1 = fig.add_axes([0.1, 0.04, 0.22, 0.06])
-btn_rerand = Button(btn_ax1, "Rerandomize gates")
-
-btn_ax2 = fig.add_axes([0.34, 0.04, 0.18, 0.06])
-btn_smooth = Button(btn_ax2, "Smooth: ON" if smooth_enabled else "Smooth: OFF")
-
-btn_ax3 = fig.add_axes([0.54, 0.04, 0.14, 0.06])
-btn_play = Button(btn_ax3, "Play")
-
-slider_ax_gates = fig.add_axes([0.86, 0.2, 0.03, 0.68])
-slider_ax_rovers = fig.add_axes([0.92, 0.2, 0.03, 0.68])
-
-slider_gates = Slider(
-    slider_ax_gates,
-    "Docks",
-    MIN_GATES,
-    MAX_GATES,
-    valinit=NUM_GATES,
-    valstep=1,
-    orientation="vertical",
-)
-
-slider_rovers = Slider(
-    slider_ax_rovers,
-    "Rovers",
-    1,
-    max_rovers_for_gates(NUM_GATES),
-    valinit=num_rovers,
-    valstep=1,
-    orientation="vertical",
-)
-
-# ============================================================
-# DRAW / RESET
-# ============================================================
-def clear_gate_artists():
-    global gate_artists
-    for a in gate_artists:
-        try:
-            a.remove()
-        except Exception:
-            pass
-    gate_artists = []
-
-def clear_rover_artists():
-    global rover_artists, rover_trails, rover_plan_lines
-    for a in rover_artists + rover_trails + rover_plan_lines:
-        try:
-            a.remove()
-        except Exception:
-            pass
-    rover_artists = []
-    rover_trails = []
-    rover_plan_lines = []
-
-def reset_rovers(count):
-    global rover_current_gates, rover_last_gates, rover_docked, rover_states
-    global rover_executed_xy, rover_plans, rover_play_idx, rover_moving, rover_goal_gates
-    global rover_intersection_constraints, playing, intersections_dirty
-
-    clear_rover_artists()
-
-    rover_current_gates = []
-    rover_last_gates = []
-    rover_docked = []
-    rover_states = []
-    rover_executed_xy = []
-    rover_plans = []
-    rover_play_idx = []
-    rover_moving = []
-    rover_goal_gates = []
-    rover_intersection_constraints = []
-
-    for i in range(count):
-        gate_idx = i % NUM_GATES
-        rover_current_gates.append(gate_idx)
-        rover_last_gates.append(None)
-        rover_docked.append(True)
-        rover_states.append((D_pts[gate_idx][0], D_pts[gate_idx][1], H_req[gate_idx]))
-        rover_executed_xy.append([np.array([D_pts[gate_idx][0], D_pts[gate_idx][1]])])
-        rover_plans.append(None)
-        rover_play_idx.append(0)
-        rover_moving.append(False)
-        rover_goal_gates.append(None)
-
-        col = rover_colors[i % len(rover_colors)]
-        rover_poly = Polygon(square_corners((0, 0), 0.0, S),
-                             closed=True, facecolor=col,
-                             edgecolor=(0.1, 0.1, 0.1), linewidth=2.2, alpha=0.95)
-        rover_poly.set_xy(square_corners((rover_states[i][0], rover_states[i][1]), rover_states[i][2], S))
-        ax.add_patch(rover_poly)
-        rover_artists.append(rover_poly)
-
-        trail_line, = ax.plot([], [], linewidth=2.0, alpha=0.55, color=col)
-        rover_trails.append(trail_line)
-
-        plan_line, = ax.plot([], [], linestyle="--", linewidth=2.2, alpha=0.5, color=col)
-        rover_plan_lines.append(plan_line)
-
-    playing = False
-    btn_play.label.set_text("Play")
-    intersections_dirty = True
-
-def pick_next_gate(rover_idx):
-    cur = rover_current_gates[rover_idx]
-    last = rover_last_gates[rover_idx]
-    reserved = {
-        rover_goal_gates[i]
-        for i in range(len(rover_goal_gates))
-        if rover_goal_gates[i] is not None and i != rover_idx
-    }
-    occupied = {
-        rover_current_gates[i]
-        for i in range(len(rover_current_gates))
-        if i != rover_idx and rover_docked[i]
-    }
-    candidates = [
-        i for i in range(NUM_GATES)
-        if i != cur and i != last and i not in occupied and i not in reserved
+# ===================== SIM =====================
+class Sim:
+    gate_colors = [
+        (0.2,0.7,0.9),(0.9,0.55,0.2),(0.55,0.9,0.35),(0.85,0.35,0.75),(0.95,0.9,0.25),
+        (0.6,0.8,0.7),(0.9,0.4,0.4),(0.5,0.5,0.9),(0.9,0.75,0.5),(0.7,0.4,0.7)
     ]
-    if not candidates:
-        candidates = [
-            i for i in range(NUM_GATES)
-            if i != cur and i not in occupied and i not in reserved
-        ]
-    if not candidates:
-        return cur
+    rover_colors = [
+        (0.92,0.92,0.95),(0.95,0.6,0.6),(0.6,0.95,0.6),(0.6,0.6,0.95),(0.95,0.95,0.6)
+    ]
 
-    cur_dock = D_pts[cur]
-    distances = [(i, np.linalg.norm(D_pts[i] - cur_dock)) for i in candidates]
-    distances.sort(key=lambda x: (-x[1], x[0]))
-    return distances[0][0]
+    def __init__(self):
+        self.seed = BASE_SEED
+        self.num_docks = NUM_GATES
+        self.num_rovers = 1
+        self.smooth = SMOOTH_DEFAULT
+        self.auto = False
 
-def compute_intersection_constraints():
-    n = len(rover_plans)
-    constraints = []
-    for i in range(n):
-        path_i = rover_plans[i]
-        if not path_i or len(path_i) < 2:
-            continue
-        segs_i = list(zip(path_i[:-1], path_i[1:]))
-        for j in range(i + 1, n):
-            path_j = rover_plans[j]
-            if not path_j or len(path_j) < 2:
+        self.gates = []
+        self.walls = []
+        self.bounds = (-WORLD_HALFSPAN, WORLD_HALFSPAN, -WORLD_HALFSPAN, WORLD_HALFSPAN)
+        self.WI = WallIndex([])
+
+        self.nodes = []
+        self.nbrs = []
+        self.rovers: List[Rover] = []
+
+        self.fig = None
+        self.ax = None
+        self.gate_art = []
+        self.rover_art = []
+        self.sld_d = None
+        self.sld_r = None
+        self.btn_play = None
+        self.btn_sm = None
+        self.btn_rerand = None
+        self.ani = None
+
+        self.frame = 0
+
+    # ----- world gen helpers -----
+    def _circle_hits_walls(self, x, y, walls, r=ROVER_R_WALL):
+        p = np.array([x, y], float)
+        rr = r*r
+        for w0, w1 in walls:
+            if pt_seg_d2(p, np.array(w0, float), np.array(w1, float)) < rr:
+                return True
+        return False
+
+    def _seg_hits_walls(self, a, b, walls, r=ROVER_R_WALL):
+        a = np.array(a, float)
+        b = np.array(b, float)
+        rr = r*r
+        for w0, w1 in walls:
+            c = np.array(w0, float)
+            d = np.array(w1, float)
+            if seg_intersect(a, b, c, d):
+                return True
+            if min(pt_seg_d2(a, c, d), pt_seg_d2(b, c, d),
+                   pt_seg_d2(c, a, b), pt_seg_d2(d, a, b)) < rr:
+                return True
+        return False
+
+    def generate_world(self, n, seed):
+        rng = np.random.default_rng(seed)
+        bounds = (-WORLD_HALFSPAN, WORLD_HALFSPAN, -WORLD_HALFSPAN, WORLD_HALFSPAN)
+        gates = []
+        tries = 0
+
+        while len(gates) < n and tries < 50000:
+            tries += 1
+            c = rng.uniform(-0.7*WORLD_HALFSPAN, 0.7*WORLD_HALFSPAN, size=2)
+            th = float(rng.uniform(-np.pi, np.pi))
+            g = Gate(center=c, theta=th)
+
+            if any(np.linalg.norm(g.center - gg.center) < MIN_GATE_SEP for gg in gates):
                 continue
-            segs_j = list(zip(path_j[:-1], path_j[1:]))
-            first_i = None
-            first_j = None
-            for idx_i, (a, b) in enumerate(segs_i):
-                a_xy = (a[0], a[1])
-                b_xy = (b[0], b[1])
-                hit = False
-                for idx_j, (c, d) in enumerate(segs_j):
-                    c_xy = (c[0], c[1])
-                    d_xy = (d[0], d[1])
-                    if seg_intersect(a_xy, b_xy, c_xy, d_xy):
-                        first_i = idx_i + 1
-                        first_j = idx_j + 1
-                        hit = True
-                        break
-                if hit:
+
+            other = [w for gg in gates for w in gg.walls]
+
+            if not within(g.dock, bounds, BOUND_MARGIN) or not within(g.approach, bounds, BOUND_MARGIN):
+                continue
+
+            if self._circle_hits_walls(g.dock[0], g.dock[1], other): continue
+            if self._circle_hits_walls(g.approach[0], g.approach[1], other): continue
+            if self._circle_hits_walls(g.dock[0], g.dock[1], g.walls): continue
+            if self._circle_hits_walls(g.approach[0], g.approach[1], g.walls): continue
+
+            if self._seg_hits_walls(g.approach, g.dock, g.walls): continue
+            if self._seg_hits_walls(g.approach, g.dock, other): continue
+
+            gates.append(g)
+
+        if len(gates) < n:
+            raise RuntimeError("Failed to generate a dockable world. Try WORLD_HALFSPAN bigger or MIN_GATE_SEP smaller.")
+
+        walls = [w for g in gates for w in g.walls]
+        return gates, walls, bounds
+
+    def build_prm(self, seed):
+        rng = np.random.default_rng(seed + 12345)
+        xmin, xmax, ymin, ymax = self.bounds
+        nodes = []
+
+        while len(nodes) < PRM_SAMPLES:
+            x = float(rng.uniform(xmin + BOUND_MARGIN, xmax - BOUND_MARGIN))
+            y = float(rng.uniform(ymin + BOUND_MARGIN, ymax - BOUND_MARGIN))
+            th = float(rng.uniform(-np.pi, np.pi))
+            if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
+                continue
+            nodes.append((x, y, th))
+
+        for g in self.gates:
+            nodes.append((float(g.approach[0]), float(g.approach[1]), float(g.heading)))
+
+        return nodes, knn_lists(nodes, PRM_K)
+
+    def reset(self, seed):
+        self.auto = False
+        self.seed = seed
+        self.frame = 0
+
+        self.gates, self.walls, self.bounds = self.generate_world(self.num_docks, seed)
+        self.WI.set(self.walls)
+        self.nodes, self.nbrs = self.build_prm(seed)
+
+        self.rovers = []
+        for i in range(self.num_rovers):
+            gi = i % len(self.gates)
+            g = self.gates[gi]
+            r = Rover(
+                i, gi, -1,
+                (float(g.dock[0]), float(g.dock[1]), float(g.heading)),
+                docked=True, moving=False
+            )
+            r.trail.append(np.array([g.dock[0], g.dock[1]], float))
+            self.rovers.append(r)
+
+        if self.ax is not None:
+            self.redraw()
+
+    # ----- dock logic -----
+    def dock_free(self, dock, exclude=-1):
+        for r in self.rovers:
+            if r.id == exclude:
+                continue
+            if r.current_gate == dock or r.goal_gate == dock:
+                return False
+        return True
+
+    def unavailable(self, exclude=-1):
+        s = set()
+        for r in self.rovers:
+            if r.id == exclude:
+                continue
+            s.add(r.current_gate)
+            if r.goal_gate >= 0:
+                s.add(r.goal_gate)
+        return s
+
+    def furthest_dock(self, cur, prev, rid):
+        curp = self.gates[cur].dock
+        bad = self.unavailable(rid)
+        best, bestd = -1, -1.0
+        for i, g in enumerate(self.gates):
+            if i == cur or i == prev or i in bad:
+                continue
+            d = float(np.linalg.norm(g.dock - curp))
+            if d > bestd:
+                bestd, best = d, i
+        return best
+
+    # ----- planning -----
+    def plan_prm(self, start, goal, obstacle_pts):
+        tmp_nodes = self.nodes + [start, goal]
+        si = len(tmp_nodes) - 2
+        gi = len(tmp_nodes) - 1
+
+        tmp_nbrs = [lst[:] for lst in self.nbrs] + [[], []]
+        sN = knn_temp(start, self.nodes, TEMP_K)
+        gN = knn_temp(goal, self.nodes, TEMP_K)
+        tmp_nbrs[si] = sN
+        tmp_nbrs[gi] = gN
+
+        for j in sN:
+            if si not in tmp_nbrs[j]:
+                tmp_nbrs[j].append(si)
+        for j in gN:
+            if gi not in tmp_nbrs[j]:
+                tmp_nbrs[j].append(gi)
+
+        def blocked_by_rovers_xy(x, y):
+            for ox, oy in obstacle_pts:
+                if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
+                    return True
+            return False
+
+        def edge_ok(a, b):
+            ax, ay, _ = a
+            bx, by, _ = b
+            if self.WI.collides_pose(ax, ay, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
+            if self.WI.collides_pose(bx, by, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
+            if blocked_by_rovers_xy(ax, ay) or blocked_by_rovers_xy(bx, by): return False
+            if self.WI.collides_seg((ax, ay), (bx, by), self.bounds, BOUND_MARGIN, r=ROVER_R_WALL): return False
+            # extra rover clearance along edge (cheap sample)
+            mx, my = 0.5*(ax+bx), 0.5*(ay+by)
+            return not blocked_by_rovers_xy(mx, my)
+
+        idx = astar_lazy(tmp_nodes, tmp_nbrs, si, gi, edge_ok, se2_cost)
+        if idx is None:
+            return None
+
+        pb = []
+        for a_i, b_i in zip(idx[:-1], idx[1:]):
+            seg = densify_edge(tmp_nodes[a_i], tmp_nodes[b_i])
+            pb += seg[1:] if pb else seg
+        return pb
+
+    def plan_rover(self, r: Rover, goal_gate: int):
+        if not self.dock_free(goal_gate, r.id):
+            return False
+
+        cur = self.gates[r.current_gate]
+        goal = self.gates[goal_gate]
+
+        obstacle_pts = [(o.state[0], o.state[1]) for o in self.rovers if o.id != r.id]
+
+        pb = []
+        if r.docked:
+            und = densify_straight(cur.dock, cur.approach, cur.heading)
+            for x, y, _ in und:
+                if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
+                    return False
+                for ox, oy in obstacle_pts:
+                    if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
+                        return False
+            pb += und
+            start = (float(cur.approach[0]), float(cur.approach[1]), float(cur.heading))
+        else:
+            start = r.state
+
+        goal_pose = (float(goal.approach[0]), float(goal.approach[1]), float(goal.heading))
+        free = self.plan_prm(start, goal_pose, obstacle_pts)
+        if free is None:
+            return False
+        pb += free[1:]
+
+        dock = densify_straight(goal.approach, goal.dock, goal.heading)
+        for x, y, _ in dock:
+            if self.WI.collides_pose(x, y, self.bounds, BOUND_MARGIN, r=ROVER_R_WALL):
+                return False
+            for ox, oy in obstacle_pts:
+                if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
+                    return False
+        pb += dock[1:]
+
+        pb = smooth_mid(pb, r.current_gate, goal_gate, self.gates, self.WI, self.bounds, BOUND_MARGIN, self.smooth)
+
+        r.path = pb
+        r.idx = 0
+        r.goal_gate = goal_gate
+        r.moving = True
+        r.docked = False
+        r.stuck = 0
+        r.reversing = False
+        r.blocked_by = -1
+        return True
+
+    # ----- traffic -----
+    def resolve_traffic(self):
+        active = [r for r in self.rovers if r.moving and r.path]
+        if not active:
+            return 0
+
+        # propose indices
+        desired = {}
+        for r in active:
+            r.blocked_by = -1
+            if r.reversing:
+                ni = r.idx - 1
+                desired[r.id] = ni if (ni >= r.reverse_target and ni >= 0) else r.idx
+            else:
+                desired[r.id] = min(r.idx + PLAYBACK_SKIP, len(r.path) - 1)
+
+        # commit sequentially by priority to avoid simultaneous collisions
+        order = sorted(active, key=lambda rr: (0 if rr.reversing else 1, -rr.stuck, rr.id))
+
+        committed_pos = {}     # rid -> np.array([x,y])
+        committed_seg = []     # list of (a,b) segments in this frame (np arrays)
+        moved = set()
+        waiting = 0
+
+        id_to_rover = {r.id: r for r in self.rovers}
+
+        for r in order:
+            ni = desired[r.id]
+            if ni == r.idx:
+                waiting += 1
+                r.stuck += 1
+                continue
+
+            p0 = np.array([r.state[0], r.state[1]], float)
+            p1 = np.array([r.path[ni][0], r.path[ni][1]], float)
+
+            ok = True
+
+            # vs committed new positions
+            for pos in committed_pos.values():
+                if np.sum((p1 - pos)**2) < ROVER_SEP2:
+                    ok = False
                     break
-            if first_i is not None:
-                constraints.append((i, j, first_i, first_j))
-    return constraints
 
-def plan_next_rover_path(rover_idx):
-    global intersections_dirty
-    goal = pick_next_gate(rover_idx)
-    if goal == rover_current_gates[rover_idx]:
-        return False
-    plan = plan_to_gate(rover_idx, goal)
-    if plan is None:
-        return False
-    rover_plans[rover_idx] = plan
-    rover_play_idx[rover_idx] = 0
-    rover_moving[rover_idx] = True
-    rover_goal_gates[rover_idx] = goal
-    rover_plan_lines[rover_idx].set_data([p[0] for p in plan], [p[1] for p in plan])
-    intersections_dirty = True
-    return True
+            # vs committed motion segments (prevents clipping / crossings)
+            if ok:
+                for a, b in committed_seg:
+                    if seg_seg_d2(p0, p1, a, b) < ROVER_SEP2:
+                        ok = False
+                        break
 
-def states_too_close(state_a, state_b, min_dist=COLLISION_DISTANCE):
-    ax, ay, _ = state_a
-    bx, by, _ = state_b
-    return (ax - bx)**2 + (ay - by)**2 < min_dist**2
+            # conservative vs not-yet-committed rovers' CURRENT positions
+            if ok:
+                for o in self.rovers:
+                    if o.id == r.id or o.id in committed_pos:
+                        continue
+                    ox, oy, _ = o.state
+                    d2 = (p1[0]-ox)**2 + (p1[1]-oy)**2
+                    if d2 < ROVER_SEP2:
+                        ok = False
+                        r.blocked_by = o.id
+                        break
 
-def resolve_step_conflicts(candidates, current_states):
-    """
-    candidates: dict rover_idx -> next_state
-    current_states: list of rover states (x,y,th)
-    Returns set of rover indices allowed to advance this step.
-    """
-    if not candidates:
-        return set()
+            if ok:
+                r.idx = ni
+                r.state = r.path[r.idx]
+                r.trail.append(np.array([r.state[0], r.state[1]], float))
+                committed_pos[r.id] = p1
+                committed_seg.append((p0, p1))
+                moved.add(r.id)
+                if not r.reversing:
+                    r.stuck = max(0, r.stuck - 1)
+            else:
+                waiting += 1
+                r.stuck += 1
 
-    allowed = set(candidates.keys())
-    rover_list = sorted(candidates.keys())
-
-    # block moves that would collide with stationary or non-advancing rovers
-    for i in rover_list:
-        if i not in allowed:
-            continue
-        next_state = candidates[i]
-        for j, cur_state in enumerate(current_states):
-            if j == i:
+        # cycle-breaker: if blocked graph has a cycle, force the highest-id rover in the cycle to reverse
+        # (only if it has room to reverse)
+        blocked_map = {r.id: r.blocked_by for r in active if (r.id not in moved and r.blocked_by != -1)}
+        seen = set()
+        for start in list(blocked_map.keys()):
+            if start in seen:
                 continue
-            if j in candidates:
-                continue
-            if states_too_close(next_state, cur_state):
-                allowed.discard(i)
-                break
+            chain = []
+            cur = start
+            while cur in blocked_map and cur not in seen:
+                seen.add(cur)
+                chain.append(cur)
+                cur = blocked_map[cur]
+                if cur in chain:
+                    cyc = chain[chain.index(cur):]
+                    rid = max(cyc)
+                    rr = id_to_rover.get(rid)
+                    if rr and (not rr.reversing) and rr.idx > 10:
+                        rr.reversing = True
+                        rr.reverse_target = max(0, rr.idx - 60)
+                        rr.stuck = 0
+                    break
 
-    # resolve pairwise conflicts between advancing rovers by priority (lower index wins)
-    rover_list = sorted(list(allowed))
-    for idx, i in enumerate(rover_list):
-        if i not in allowed:
-            continue
-        for j in rover_list[idx+1:]:
-            if j not in allowed:
-                continue
-            if states_too_close(candidates[i], candidates[j]):
-                allowed.discard(j)
+        # if reversing rover reached target or can’t reverse, stop reversing cleanly next frame
+        for r in active:
+            if r.reversing and (r.idx <= r.reverse_target or r.idx <= 0):
+                r.reversing = False
 
-    return allowed
+        return waiting
 
-def redraw_world():
-    xmin, xmax, ymin, ymax = WORLD_BOUNDS
-    ax.set_xlim(xmin, xmax)
-    ax.set_ylim(ymin, ymax)
+    # ===================== VISUALS =====================
+    def setup_vis(self):
+        self.fig, self.ax = plt.subplots(figsize=(10.5, 9.5))
+        plt.subplots_adjust(left=0.18, bottom=0.14)
+        ax = self.ax
+        ax.set_aspect("equal", "box")
+        ax.set_facecolor((0.06, 0.07, 0.09))
+        self.fig.patch.set_facecolor((0.06, 0.07, 0.09))
+        for sp in ax.spines.values():
+            sp.set_color((0.35, 0.35, 0.4))
+        ax.tick_params(colors=(0.75, 0.75, 0.8))
+        ax.grid(True, alpha=0.12)
 
-    clear_gate_artists()
+        sd = self.fig.add_axes([0.02, 0.75, 0.10, 0.03])
+        sd.set_facecolor((0.15, 0.15, 0.18))
+        self.sld_d = Slider(sd, 'Docks', 2, 10, valinit=self.num_docks, valstep=1, color=(0.3, 0.6, 0.8))
 
-    for i, g in enumerate(gates):
-        col = gate_colors[i % len(gate_colors)]
-        for (w0, w1) in g.walls_world():
-            ln, = ax.plot([w0[0], w1[0]], [w0[1], w1[1]],
-                          linewidth=3.2, alpha=0.9, color=col, solid_capstyle="round")
-            gate_artists.append(ln)
+        sr = self.fig.add_axes([0.02, 0.65, 0.10, 0.03])
+        sr.set_facecolor((0.15, 0.15, 0.18))
+        self.sld_r = Slider(sr, 'Rovers', 1, max(1, self.num_docks//2), valinit=self.num_rovers, valstep=1, color=(0.6, 0.8, 0.3))
 
-        p1, p2 = g.opening_endpoints_world()
-        sc1 = ax.scatter([p1[0], p2[0]], [p1[1], p2[1]], s=24, color=col, alpha=0.95)
-        gate_artists.append(sc1)
+        ap = self.fig.add_axes([0.02, 0.50, 0.10, 0.06])
+        self.btn_play = Button(ap, 'Play', color=(0.15, 0.15, 0.18), hovercolor=(0.25, 0.4, 0.25))
 
-        scA = ax.scatter([A_pts[i][0]], [A_pts[i][1]], s=70, marker="x", color=(1,1,1), alpha=0.75)
-        gate_artists.append(scA)
+        b1 = self.fig.add_axes([0.20, 0.04, 0.22, 0.06])
+        self.btn_rerand = Button(b1, "Rerandomize gates")
+        self.btn_rerand.on_clicked(lambda _ : self.reset(self.seed + 1))
 
-        scD = ax.scatter([D_pts[i][0]], [D_pts[i][1]], s=55, marker="o",
-                         edgecolors=col, facecolors="none", linewidths=2)
-        gate_artists.append(scD)
+        b2 = self.fig.add_axes([0.46, 0.04, 0.18, 0.06])
+        self.btn_sm = Button(b2, "Smooth: ON" if self.smooth else "Smooth: OFF")
 
-        txt = ax.text(g.center[0], g.center[1], f"G{i}",
-                      color=(0.95,0.95,0.98), ha="center", va="center",
-                      fontsize=11, alpha=0.95)
-        gate_artists.append(txt)
+        self.sld_d.on_changed(self.on_docks)
+        self.sld_r.on_changed(self.on_rovers)
+        self.btn_play.on_clicked(self.on_play)
+        self.btn_sm.on_clicked(self.on_smooth)
+        self.fig.canvas.mpl_connect("button_press_event", self.on_click)
 
-    for i in range(len(rover_states)):
-        rover_plan_lines[i].set_data([], [])
-        rover_trails[i].set_data([], [])
-        rover_artists[i].set_xy(square_corners((rover_states[i][0], rover_states[i][1]),
-                                               rover_states[i][2], S))
+    def clear_art(self):
+        for a in self.gate_art:
+            try: a.remove()
+            except: pass
+        self.gate_art = []
+        for p, l in self.rover_art:
+            try: p.remove()
+            except: pass
+            try: l.remove()
+            except: pass
+        self.rover_art = []
 
-    ax.set_title("Play: rovers navigate between furthest docks",
-                 color=(0.9, 0.9, 0.95), pad=12)
-    fig.canvas.draw_idle()
+    def redraw(self):
+        ax = self.ax
+        xmin, xmax, ymin, ymax = self.bounds
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
 
-def reset_world(new_seed):
-    global world_seed, gates, all_walls, WORLD_BOUNDS, A_pts, D_pts, H_req
-    global nodes, nbrs
+        self.clear_art()
 
-    world_seed = new_seed
-    gates, all_walls, WORLD_BOUNDS = generate_world(NUM_GATES, world_seed)
+        for i, g in enumerate(self.gates):
+            col = self.gate_colors[i % len(self.gate_colors)]
+            for w0, w1 in g.walls:
+                ln, = ax.plot([w0[0], w1[0]], [w0[1], w1[1]], lw=3.2, alpha=0.9, color=col, solid_capstyle="round")
+                self.gate_art.append(ln)
+            self.gate_art.append(ax.scatter([g.open_p1[0], g.open_p2[0]], [g.open_p1[1], g.open_p2[1]], s=24, color=col, alpha=0.95))
+            self.gate_art.append(ax.scatter([g.approach[0]], [g.approach[1]], s=70, marker="x", color=(1,1,1), alpha=0.75))
+            self.gate_art.append(ax.scatter([g.dock[0]], [g.dock[1]], s=55, marker="o", edgecolors=col, facecolors="none", linewidths=2))
+            self.gate_art.append(ax.text(g.center[0], g.center[1], f"G{i}", color=(0.95,0.95,0.98), ha="center", va="center", fontsize=11, alpha=0.95))
 
-    A_pts = [g.approach_center(APPROACH_L) for g in gates]
-    D_pts = [g.dock_center()              for g in gates]
-    H_req = [g.required_heading()         for g in gates]
+        self.rover_art = []
+        for r in self.rovers:
+            col = self.rover_colors[r.id % len(self.rover_colors)]
+            poly = Polygon(square_corners((r.state[0], r.state[1]), r.state[2], S),
+                           closed=True, facecolor=col, edgecolor=(0.1,0.1,0.1), lw=2.2, alpha=0.95)
+            ax.add_patch(poly)
+            line, = ax.plot([], [], lw=2.0, alpha=0.55, color=col)
+            r.poly, r.line = poly, line
+            r.trail.clear()
+            r.trail.append(np.array([r.state[0], r.state[1]], float))
+            self.rover_art.append((poly, line))
 
-    nodes, nbrs = build_prm_for_current_world(world_seed)
+        self.auto = False
+        self.btn_play.label.set_text("Play")
+        ax.set_title(f"Docks: {self.num_docks} | Rovers: {self.num_rovers} | Click gate or press Play",
+                     color=(0.9,0.9,0.95), pad=12)
+        self.fig.canvas.draw_idle()
 
-    reset_rovers(num_rovers)
-    redraw_world()
+    # ----- events -----
+    def on_smooth(self, _):
+        self.smooth = not self.smooth
+        self.btn_sm.label.set_text("Smooth: ON" if self.smooth else "Smooth: OFF")
+        self.fig.canvas.draw_idle()
 
-def on_rerandomize(_event):
-    reset_world(world_seed + 1)
+    def on_docks(self, val):
+        self.num_docks = int(val)
+        maxr = max(1, self.num_docks // 2)
+        self.sld_r.valmax = maxr
+        self.sld_r.ax.set_xlim(1, maxr)
+        if self.num_rovers > maxr:
+            self.num_rovers = maxr
+            self.sld_r.set_val(maxr)
+        self.reset(self.seed)
 
-def on_toggle_smooth(_event):
-    global smooth_enabled
-    smooth_enabled = not smooth_enabled
-    btn_smooth.label.set_text("Smooth: ON" if smooth_enabled else "Smooth: OFF")
-    fig.canvas.draw_idle()
+    def on_rovers(self, val):
+        self.num_rovers = int(val)
+        self.reset(self.seed)
 
-def on_toggle_play(_event):
-    global playing
-    playing = not playing
-    btn_play.label.set_text("Pause" if playing else "Play")
-    fig.canvas.draw_idle()
+    def on_play(self, _):
+        self.auto = not self.auto
+        self.btn_play.label.set_text("Stop" if self.auto else "Play")
+        if self.auto:
+            for r in self.rovers:
+                if r.docked and not r.moving and r.plan_cd == 0:
+                    nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
+                    if nxt >= 0:
+                        if not self.plan_rover(r, nxt):
+                            r.plan_cd = 30
+            self.ax.set_title(f"Running | Docks: {self.num_docks} | Rovers: {self.num_rovers}", color=(0.6,0.95,0.6))
+        else:
+            self.ax.set_title(f"Paused | Docks: {self.num_docks} | Rovers: {self.num_rovers}", color=(0.9,0.9,0.95))
+        self.fig.canvas.draw_idle()
 
-def on_gate_slider(val):
-    global NUM_GATES, num_rovers
-    new_gates = int(val)
-    if new_gates == NUM_GATES:
-        return
-    NUM_GATES = new_gates
-    max_rovers = max_rovers_for_gates(NUM_GATES)
-    num_rovers = min(num_rovers, max_rovers)
-    slider_rovers.eventson = False
-    slider_rovers.valmax = max_rovers
-    slider_rovers.ax.set_ylim(slider_rovers.valmin, max_rovers)
-    slider_rovers.set_val(num_rovers)
-    slider_rovers.eventson = True
-    reset_world(world_seed)
+    def nearest_gate(self, xy):
+        d = [float(np.linalg.norm(g.dock - xy)) for g in self.gates]
+        i = int(np.argmin(d))
+        return i, d[i]
 
-def on_rover_slider(val):
-    global num_rovers
-    new_rovers = int(val)
-    if new_rovers == num_rovers:
-        return
-    num_rovers = new_rovers
-    reset_rovers(num_rovers)
-    redraw_world()
+    def on_click(self, ev):
+        if ev.inaxes != self.ax:
+            return
+        if (not self.auto) and any(r.moving for r in self.rovers):
+            return
+        click = np.array([ev.xdata, ev.ydata], float)
+        gi, dist = self.nearest_gate(click)
+        if dist > 1.6 * S:
+            return
+        r = next((rr for rr in self.rovers if rr.docked and not rr.moving and rr.current_gate != gi), None)
+        if r is None:
+            return
 
-btn_rerand.on_clicked(on_rerandomize)
-btn_smooth.on_clicked(on_toggle_smooth)
-btn_play.on_clicked(on_toggle_play)
+        self.ax.set_title(f"Planning: Rover {r.id} Gate {r.current_gate} → Gate {gi} ...", color=(0.9,0.9,0.95))
+        self.fig.canvas.draw_idle()
 
-slider_gates.on_changed(on_gate_slider)
-slider_rovers.on_changed(on_rover_slider)
+        ok = self.plan_rover(r, gi)
 
-# ============================================================
-# ANIMATION
-# ============================================================
-def animate(_):
-    global intersections_dirty, rover_intersection_constraints
-
-    if playing:
-        all_idle = all(
-            (not rover_moving[i]) and rover_plans[i] is None
-            for i in range(len(rover_states))
+        self.ax.set_title(
+            f"Executing: Rover {r.id} Gate {r.current_gate} → Gate {gi}" if ok else "No path found. Try again.",
+            color=(0.9,0.9,0.95) if ok else (0.95,0.6,0.6)
         )
-        if all_idle:
-            for i in range(len(rover_states)):
-                plan_next_rover_path(i)
+        self.fig.canvas.draw_idle()
 
-    if intersections_dirty:
-        rover_intersection_constraints = compute_intersection_constraints()
-        intersections_dirty = False
+    # ----- animation -----
+    def animate(self, _):
+        self.frame += 1
+        for r in self.rovers:
+            if r.plan_cd > 0:
+                r.plan_cd -= 1
 
-    rover_intersections = [False] * len(rover_states)
-    for i, j, _idx_i, _idx_j in rover_intersection_constraints:
-        rover_intersections[i] = True
-        rover_intersections[j] = True
+        waiting = self.resolve_traffic()
 
-    allowed_to_move = set(range(len(rover_states)))
-    for i, j, idx_i, idx_j in rover_intersection_constraints:
-        if not (rover_moving[j] and rover_plans[j]):
-            continue
-        if rover_play_idx[j] > idx_j:
-            continue
-        if rover_moving[i] and rover_plans[i] and rover_play_idx[i] <= idx_i:
-            allowed_to_move.discard(j)
+        for r in self.rovers:
+            if not (r.moving and r.path):
+                continue
 
-    for _k in range(PLAYBACK_SKIP):
-        candidates = {}
-        for i in range(len(rover_states)):
-            if rover_moving[i] and rover_plans[i] is not None:
-                if (i in allowed_to_move) or not rover_intersections[i]:
-                    if rover_play_idx[i] < len(rover_plans[i]):
-                        candidates[i] = rover_plans[i][rover_play_idx[i]]
+            # arrival
+            if r.idx >= len(r.path) - 1:
+                if self.dock_free(r.goal_gate, r.id):
+                    g = self.gates[r.goal_gate]
+                    r.state = (float(g.dock[0]), float(g.dock[1]), float(g.heading))
+                    r.trail.append(np.array([r.state[0], r.state[1]], float))
+                    r.previous_gate, r.current_gate = r.current_gate, r.goal_gate
+                    r.goal_gate = -1
+                    r.path = None
+                    r.moving = False
+                    r.docked = True
+                    r.stuck = 0
+                    r.reversing = False
 
-        allowed_step = resolve_step_conflicts(candidates, rover_states)
+                    if self.auto and r.plan_cd == 0:
+                        nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
+                        if nxt >= 0 and (not self.plan_rover(r, nxt)):
+                            r.plan_cd = 30
+                else:
+                    new = self.furthest_dock(r.current_gate, r.goal_gate, r.id)
+                    r.goal_gate = -1
+                    r.path = None
+                    r.moving = False
+                    r.reversing = False
+                    if new >= 0 and r.plan_cd == 0:
+                        if not self.plan_rover(r, new):
+                            r.plan_cd = 30
 
-        if not allowed_step:
-            break
+            # stuck fallback: replan occasionally (cooldown prevents spikes)
+            if r.stuck > 140 and r.goal_gate >= 0 and r.plan_cd == 0:
+                r.stuck = 0
+                if not self.plan_rover(r, r.goal_gate):
+                    r.plan_cd = 45
 
-        for i in sorted(allowed_step):
-            rover_states[i] = candidates[i]
-            rover_play_idx[i] += 1
-            rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
+        # auto: retry idle rovers occasionally
+        if self.auto:
+            for r in self.rovers:
+                if r.docked and not r.moving and r.goal_gate == -1 and r.plan_cd == 0:
+                    nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
+                    if nxt >= 0 and (not self.plan_rover(r, nxt)):
+                        r.plan_cd = 30
 
-        for i in list(allowed_step):
-            if rover_play_idx[i] >= len(rover_plans[i]):
-                goal_gate = rover_goal_gates[i]
-                rover_states[i] = (D_pts[goal_gate][0], D_pts[goal_gate][1], H_req[goal_gate])
-                rover_executed_xy[i].append(np.array([rover_states[i][0], rover_states[i][1]]))
-                rover_last_gates[i] = rover_current_gates[i]
-                rover_current_gates[i] = goal_gate
-                rover_goal_gates[i] = None
-                rover_plans[i] = None
-                rover_play_idx[i] = 0
-                rover_moving[i] = False
-                rover_docked[i] = True
-                rover_plan_lines[i].set_data([], [])
-                intersections_dirty = True
+        # draw
+        for r in self.rovers:
+            if r.poly:
+                r.poly.set_xy(square_corners((r.state[0], r.state[1]), r.state[2], S))
+            if r.line and len(r.trail) > 0:
+                t = np.array(r.trail, float)
+                r.line.set_data(t[:,0], t[:,1])
 
-    for i in range(len(rover_states)):
-        rover_artists[i].set_xy(square_corners((rover_states[i][0], rover_states[i][1]),
-                                               rover_states[i][2], S))
-        t = np.array(rover_executed_xy[i])
-        rover_trails[i].set_data(t[:, 0], t[:, 1])
+        # throttle title updates (big perf win)
+        if self.frame % TITLE_EVERY == 0:
+            moving = sum(1 for r in self.rovers if r.moving)
+            if moving or waiting:
+                self.ax.set_title(("Running" if self.auto else "Manual") + f" | Moving: {moving} | Waiting: {waiting}",
+                                  color=(0.6,0.95,0.6))
+            elif not self.auto:
+                self.ax.set_title(f"Docks: {self.num_docks} | Rovers: {self.num_rovers} | Click gate or press Play",
+                                  color=(0.9,0.9,0.95))
+        return []
 
-    return rover_artists + rover_plan_lines + rover_trails
+    def run(self):
+        self.setup_vis()
+        self.reset(BASE_SEED)
+        self.ani = FuncAnimation(self.fig, self.animate, interval=FRAME_MS, blit=False)
+        plt.show()
 
-# ============================================================
-# BOOT
-# ============================================================
-reset_world(BASE_SEED)
-ani = FuncAnimation(fig, animate, interval=FRAME_MS, blit=False)
-plt.show()
+
+if __name__ == "__main__":
+    Sim().run()
