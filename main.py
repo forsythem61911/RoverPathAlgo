@@ -1312,7 +1312,7 @@ class Sim:
         btn_h = 0.05
         
         ap = self.fig.add_axes([item_x, btn_y, item_w, btn_h])
-        self.btn_play = Button(ap, 'PLAY SIMULATION', color='#2C2C2E', hovercolor='#3A3A3C')
+        self.btn_play = Button(ap, 'PLAY', color='#2C2C2E', hovercolor='#3A3A3C')
         self.btn_play.label.set_color('#FFFFFF')
         self.btn_play.label.set_weight('bold')
         self.btn_play.label.set_fontsize(10)
@@ -1503,7 +1503,7 @@ class Sim:
 
     def on_play(self, _):
         self.auto = not self.auto
-        self.btn_play.label.set_text("STOP SIMULATION" if self.auto else "PLAY SIMULATION")
+        self.btn_play.label.set_text("STOP" if self.auto else "PLAY")
         if self.auto and (not self.paused):
             for r in self.rovers:
                 if r.docked and (not r.moving) and r.plan_cd == 0 and r.plan_future is None:
