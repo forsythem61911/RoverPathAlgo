@@ -1,4 +1,4 @@
-import math, random, heapq
+import math, random, heapq, time
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 from collections import deque
@@ -7,7 +7,7 @@ import multiprocessing as mp
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Polygon
+from matplotlib.patches import Polygon, Circle, Wedge, FancyBboxPatch, Rectangle
 from matplotlib.animation import FuncAnimation
 from matplotlib.widgets import Button, Slider
 
@@ -31,6 +31,8 @@ A_STAR_EXPANSION_LIMIT = 12000
 
 # costs
 W_TURN = 0.18
+GATE_CLEARANCE_PENALTY = 15.0
+GATE_CLEARANCE_R = 1.6 * S
 
 # animation
 FRAME_MS = 20
@@ -71,6 +73,13 @@ BACKOFF_STEP = 0.04             # world units per injected point
 BACKOFF_PTS = 12                # number of injected points
 FORCE_STEP_FRAMES = 22          # force step-by-step (no skipping) for a bit after backoff insert
 
+# ===================== HUMANS + CAMERA FOV =====================
+HUMAN_R = 0.42 * S
+HUMAN_FOV_DEG = 45.0              # full angle of view
+HUMAN_FOV_HALF = math.radians(HUMAN_FOV_DEG / 2.0)
+HUMAN_RANGE = 3.2 * S             # detection range from camera center
+HUMAN_RESUME_DELAY_S = 3.0        # resume this long after humans are out of view
+HUMAN_CLICK_TOL = 0.75 * HUMAN_R  # click distance to select/delete human
 
 # ===================== MATH / GEOM =====================
 
@@ -127,6 +136,64 @@ def seg_intersect(a, b, c, d, eps=1e-12):
     if abs(o3) <= eps and on_seg(c, d, a): return True
     if abs(o4) <= eps and on_seg(c, d, b): return True
     return (o1*o2 < 0) and (o3*o4 < 0)
+
+class ToggleSwitch:
+    def __init__(self, ax, label, initial_state=False, on_callback=None):
+        self.ax = ax
+        self.label = label
+        self.state = initial_state
+        self.on_callback = on_callback
+        
+        self.ax.set_xlim(-0.1, 1.1)
+        self.ax.set_ylim(-0.1, 1.1)
+        self.ax.set_aspect('equal', adjustable='datalim')
+        self.ax.axis('off')
+        
+        # Track (Pill shape)
+        self.track = FancyBboxPatch((0.0, 0.25), 1.0, 0.5, boxstyle="round,pad=0,rounding_size=0.25", 
+                                    facecolor='#39393D', edgecolor='#555555', lw=0.5)
+        self.ax.add_patch(self.track)
+        
+        # Shadow (Subtle offset)
+        self.shadow = Circle((0.25 if not self.state else 0.75, 0.48), radius=0.22, 
+                             facecolor='#111111', alpha=0.4, zorder=2)
+        self.ax.add_patch(self.shadow)
+        
+        # Thumb
+        self.thumb = Circle((0.25 if not self.state else 0.75, 0.5), radius=0.22, 
+                            facecolor='#FFFFFF', edgecolor='#DDDDDD', lw=0.5, zorder=3)
+        self.ax.add_patch(self.thumb)
+        
+        # Label text (Aesthetic update)
+        self.text = self.ax.text(-0.15, 0.5, label, va='center', ha='right', color='#E0E0E0', 
+                                fontsize=10, weight='medium')
+        
+        self._update_ui()
+        self.ax.figure.canvas.mpl_connect('button_press_event', self._on_click)
+
+    def _update_ui(self):
+        # iOS-style colors: Green for ON, Dark Gray for OFF
+        if self.state:
+            self.track.set_facecolor('#34C759')
+            pos = 0.75
+        else:
+            self.track.set_facecolor('#39393D')
+            pos = 0.25
+        
+        self.thumb.center = (pos, 0.5)
+        self.shadow.center = (pos, 0.48)
+        self.ax.figure.canvas.draw_idle()
+
+    def _on_click(self, event):
+        if event.inaxes == self.ax:
+            self.state = not self.state
+            self._update_ui()
+            if self.on_callback:
+                self.on_callback(self.state)
+
+    def set_state(self, state):
+        self.state = state
+        self._update_ui()
 
 
 # ===================== WALL INDEX =====================
@@ -244,6 +311,10 @@ class Rover:
 
     poly: Optional[Polygon] = None
     line: Optional[object] = None
+
+    # FOV visualization (front/back)
+    fov_front: Optional[Wedge] = None
+    fov_back: Optional[Wedge] = None
 
 
 # ===================== PRM / PATH =====================
@@ -493,19 +564,22 @@ _W_NBRS = None
 _W_NODE_XY = None
 _W_WI = None
 _W_BOUNDS = None
+_W_GATES = None
 
-def _worker_init(nodes, nbrs, walls, bounds):
-    global _W_NODES, _W_NBRS, _W_NODE_XY, _W_WI, _W_BOUNDS
+def _worker_init(nodes, nbrs, walls, bounds, gates):
+    global _W_NODES, _W_NBRS, _W_NODE_XY, _W_WI, _W_BOUNDS, _W_GATES
     _W_NODES = nodes
     _W_NBRS = nbrs
     _W_NODE_XY = np.array([(n[0], n[1]) for n in nodes], float)
     _W_WI = WallIndex(walls)
     _W_BOUNDS = bounds
+    _W_GATES = gates
 
 def _plan_worker(cur_state, docked,
                  cur_dock, cur_app, cur_heading,
                  goal_app, goal_dock, goal_heading,
-                 obstacle_pts, smooth_enabled):
+                 obstacle_pts, smooth_enabled,
+                 cur_gate_id, goal_gate_id):
     def blocked_by_rovers_xy(x, y):
         for ox, oy in obstacle_pts:
             if (x-ox)**2 + (y-oy)**2 < ROVER_SEP2:
@@ -551,7 +625,25 @@ def _plan_worker(cur_state, docked,
         mx, my = 0.5*(ax+bx), 0.5*(ay+by)
         return not blocked_by_rovers_xy(mx, my)
 
-    idx = astar_lazy(tmp_nodes, tmp_nbrs, si, gi, edge_ok, se2_cost)
+    def edge_cost(a, b):
+        base = se2_cost(a, b)
+        
+        # Penalize if edge or midpoint is near a gate that isn't start/goal
+        penalty = 0.0
+        pts_to_check = [a, b, (0.5*(a[0]+b[0]), 0.5*(a[1]+b[1]), a[2])]
+        for px, py, _ in pts_to_check:
+            for gi, gate in enumerate(_W_GATES):
+                if gi == cur_gate_id or gi == goal_gate_id:
+                    continue
+                # distance to gate center (or approach point might be better, but user said gate opening)
+                # Let's use gate center as a proxy for the opening/mouth
+                dist2 = (px-gate.center[0])**2 + (py-gate.center[1])**2
+                if dist2 < GATE_CLEARANCE_R**2:
+                    penalty += GATE_CLEARANCE_PENALTY
+                    break # only penalize once per point
+        return base + penalty
+
+    idx = astar_lazy(tmp_nodes, tmp_nbrs, si, gi, edge_ok, edge_cost)
     if idx is None:
         return None
 
@@ -602,6 +694,21 @@ class Sim:
 
         self.rovers: List[Rover] = []
 
+        # humans
+        self.humans: List[Tuple[float, float]] = []
+        self.human_art: List[Tuple[Circle, object]] = []  # (circle, text)
+
+        # pause / safety stop
+        self.paused = False
+        self.pause_clear_deadline: Optional[float] = None
+        self.pause_text = None
+
+        # FOV and Trails overlay
+        self.show_fov = False
+        self.show_trails = True
+        self.btn_fov = None
+        self.btn_trails = None
+
         self.fig = None
         self.ax = None
         self.gate_art = []
@@ -609,12 +716,16 @@ class Sim:
         self.sld_d = None
         self.sld_r = None
         self.btn_play = None
-        self.btn_sm = None
+        self.sw_sm = None
+        self.sw_fov = None
+        self.sw_tr = None
         self.btn_rerand = None
-        self.ani = None
 
         self.frame = 0
         self.pool: Optional[ProcessPoolExecutor] = None
+
+        # small HUD text
+        self.hud = None
 
     # ---------- pool ----------
     def _shutdown_pool(self):
@@ -630,7 +741,7 @@ class Sim:
         self.pool = ProcessPoolExecutor(
             max_workers=PLANNER_WORKERS,
             initializer=_worker_init,
-            initargs=(self.nodes, self.nbrs, self.walls, self.bounds),
+            initargs=(self.nodes, self.nbrs, self.walls, self.bounds, self.gates),
         )
 
     # ---------- world gen ----------
@@ -716,6 +827,10 @@ class Sim:
         self.seed = seed
         self.frame = 0
 
+        # keep humans (don’t wipe) so you can rerand gates and still test stops
+        self.paused = False
+        self.pause_clear_deadline = None
+
         self.gates, self.walls, self.bounds = self.generate_world(self.num_docks, seed)
         self.WI.set(self.walls)
         self.nodes, self.nbrs = self.build_prm(seed)
@@ -737,6 +852,60 @@ class Sim:
 
         if self.ax is not None:
             self.redraw()
+
+    # ---------- humans ----------
+    def _human_nearest(self, x, y):
+        if not self.humans:
+            return -1, 1e30
+        best_i, best_d = -1, 1e30
+        for i, (hx, hy) in enumerate(self.humans):
+            d = math.hypot(hx - x, hy - y)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        return best_i, best_d
+
+    def _humans_clear_art(self):
+        for c, t in self.human_art:
+            try: c.remove()
+            except: pass
+            try: t.remove()
+            except: pass
+        self.human_art = []
+
+    def _humans_redraw_art(self):
+        if self.ax is None:
+            return
+        self._humans_clear_art()
+        ax = self.ax
+        for (hx, hy) in self.humans:
+            circ = Circle((hx, hy), radius=HUMAN_R, facecolor=(0.9, 0.1, 0.1, 1.0),
+                          edgecolor=(1, 1, 1, 0.9), lw=1.5)
+            ax.add_patch(circ)
+            txt = ax.text(hx, hy, "H", color=(1, 1, 1, 1.0), ha="center", va="center",
+                          fontsize=12, weight="bold")
+            self.human_art.append((circ, txt))
+        self.fig.canvas.draw_idle()
+
+    def toggle_human_at(self, x, y):
+        if x is None or y is None:
+            return
+        if not within((x, y), self.bounds, 0.0):
+            return
+        i, d = self._human_nearest(x, y)
+        if i >= 0 and d <= HUMAN_CLICK_TOL:
+            self.humans.pop(i)
+        else:
+            self.humans.append((float(x), float(y)))
+        self._humans_redraw_art()
+
+    def delete_human_at(self, x, y):
+        if x is None or y is None:
+            return
+        i, d = self._human_nearest(x, y)
+        if i >= 0 and d <= HUMAN_CLICK_TOL:
+            self.humans.pop(i)
+            self._humans_redraw_art()
 
     # ---------- dock logic ----------
     def dock_free(self, dock, exclude=-1):
@@ -766,7 +935,7 @@ class Sim:
                 continue
             d = float(np.linalg.norm(g.dock - curp))
             if d > bestd:
-                bestd, best = d, i
+                bestd, best = d
         return best
 
     # ---------- safety ----------
@@ -811,6 +980,8 @@ class Sim:
             float(goal.heading),
             obstacle_pts,
             bool(self.smooth),
+            r.current_gate,
+            goal_gate,
         )
         r.plan_future._tok = tok  # type: ignore[attr-defined]
         return True
@@ -866,8 +1037,6 @@ class Sim:
 
     # ---------- smooth backoff segment (NO TELEPORT) ----------
     def inject_backoff_segment(self, r: Rover):
-        # Inserts small, closely spaced points behind current pose.
-        # DOES NOT move rover immediately.
         x, y, th = r.state
         dx, dy = -math.cos(th), -math.sin(th)
 
@@ -901,7 +1070,6 @@ class Sim:
         if not active:
             return 0
 
-        # propose indices
         desired = {}
         for r in active:
             r.blocked_by = -1
@@ -914,31 +1082,27 @@ class Sim:
                 else:
                     desired[r.id] = min(r.idx + PLAYBACK_SKIP, len(r.path) - 1)
 
-        # prioritize: reversing first, then closer-to-goal, then lower id
         def remain(rr: Rover):
             return (len(rr.path) - 1 - rr.idx) if rr.path else 10**9
 
         order = sorted(active, key=lambda rr: (0 if rr.reversing else 1, remain(rr), rr.id))
 
-        committed_pos = {}   # rid -> np.array([x,y])
-        committed_seg = []   # (a,b)
+        committed_pos = {}
+        committed_seg = []
         moved = set()
         waiting = 0
         id_to_rover = {r.id: r for r in self.rovers}
 
         def move_ok(r: Rover, p0, p1):
-            # vs committed new positions
             for rid, pos in committed_pos.items():
                 if np.sum((p1 - pos)**2) < ROVER_SEP2:
                     r.blocked_by = rid
                     return False
 
-            # vs committed motion segments (prevents clipping / crossings)
             for a, b in committed_seg:
                 if seg_seg_d2(p0, p1, a, b) < ROVER_SEP2:
                     return False
 
-            # vs not-yet-committed rovers' CURRENT positions
             for o in self.rovers:
                 if o.id == r.id or o.id in committed_pos:
                     continue
@@ -957,8 +1121,6 @@ class Sim:
                 continue
 
             p0 = np.array([r.state[0], r.state[1]], float)
-
-            # candidates: try desired, then one-step (helps smooth after inserts), then (if not reversing) small extra
             candidates = [ni]
             if (not r.reversing) and (ni != r.idx + 1):
                 candidates.append(min(r.idx + 1, len(r.path) - 1))
@@ -988,7 +1150,6 @@ class Sim:
             waiting += 1
             r.stuck += 1
 
-        # Deterministic yield: if blocked, wait a bit, then higher-id yields to lower-id via short reverse
         for r in active:
             if r.id in moved:
                 continue
@@ -1001,7 +1162,6 @@ class Sim:
             if r.stuck < WAIT_BEFORE_YIELD:
                 continue
 
-            # only one of the pair yields: higher id yields
             if r.id > r.blocked_by:
                 if r.idx >= BACKOFF_MIN_IDX:
                     r.reversing = True
@@ -1010,11 +1170,9 @@ class Sim:
                     r.yield_cd = YIELD_COOLDOWN
                     r.force_step = max(r.force_step, FORCE_STEP_FRAMES)
                 else:
-                    # can't reverse along path; inject a tiny backoff segment (still no teleport)
                     if self.inject_backoff_segment(r):
                         r.force_step = max(r.force_step, FORCE_STEP_FRAMES)
 
-        # cycle-breaker: if blocked graph has a cycle, force highest-id rover in cycle to reverse
         blocked_map = {r.id: r.blocked_by for r in active if (r.id not in moved and r.blocked_by != -1)}
         seen = set()
         for start in list(blocked_map.keys()):
@@ -1044,10 +1202,69 @@ class Sim:
 
         return waiting
 
+    # ===================== HUMAN DETECTION =====================
+    def _cam_positions(self, r: Rover):
+        x, y, th = r.state
+        fx = x + (S/2.0) * math.cos(th)
+        fy = y + (S/2.0) * math.sin(th)
+        bx = x - (S/2.0) * math.cos(th)
+        by = y - (S/2.0) * math.sin(th)
+        return (fx, fy, th), (bx, by, wrap(th + math.pi))
+
+    def _human_in_cam_fov(self, cam, hx, hy):
+        cx, cy, axis = cam
+        dx = hx - cx
+        dy = hy - cy
+        d2 = dx*dx + dy*dy
+        if d2 > HUMAN_RANGE * HUMAN_RANGE:
+            return False
+        ang = math.atan2(dy, dx)
+        if abs(wrap(ang - axis)) <= HUMAN_FOV_HALF:
+            return True
+        return False
+
+    def any_human_detected(self):
+        if not self.humans:
+            return False
+        for r in self.rovers:
+            cam_f, cam_b = self._cam_positions(r)
+            for (hx, hy) in self.humans:
+                # treat human as a disk: if center in view OR edge in view (cheap approx: inflate range by HUMAN_R)
+                if self._human_in_cam_fov(cam_f, hx, hy) or self._human_in_cam_fov(cam_b, hx, hy):
+                    return True
+                # edge-in-range fallback (helps when human is just outside range by radius)
+                cx, cy, axis = cam_f
+                dx, dy = hx - cx, hy - cy
+                if dx*dx + dy*dy <= (HUMAN_RANGE + HUMAN_R) ** 2:
+                    ang = math.atan2(dy, dx)
+                    if abs(wrap(ang - axis)) <= HUMAN_FOV_HALF:
+                        return True
+                cx, cy, axis = cam_b
+                dx, dy = hx - cx, hy - cy
+                if dx*dx + dy*dy <= (HUMAN_RANGE + HUMAN_R) ** 2:
+                    ang = math.atan2(dy, dx)
+                    if abs(wrap(ang - axis)) <= HUMAN_FOV_HALF:
+                        return True
+        return False
+
+    def update_pause_state(self, now_s: float):
+        detected = self.any_human_detected()
+        if detected:
+            self.paused = True
+            self.pause_clear_deadline = None
+            return
+
+        if self.paused:
+            if self.pause_clear_deadline is None:
+                self.pause_clear_deadline = now_s + HUMAN_RESUME_DELAY_S
+            if now_s >= self.pause_clear_deadline:
+                self.paused = False
+                self.pause_clear_deadline = None
+
     # ===================== VISUALS =====================
     def setup_vis(self):
-        self.fig, self.ax = plt.subplots(figsize=(10.5, 9.5))
-        plt.subplots_adjust(left=0.18, bottom=0.14)
+        self.fig, self.ax = plt.subplots(figsize=(12, 9.5))
+        plt.subplots_adjust(left=0.24, bottom=0.10, right=0.96, top=0.94)
         ax = self.ax
         ax.set_aspect("equal", "box")
         ax.set_facecolor((0.06, 0.07, 0.09))
@@ -1057,29 +1274,88 @@ class Sim:
         ax.tick_params(colors=(0.75, 0.75, 0.8))
         ax.grid(False if FAST_VIS else True, alpha=0.12)
 
-        sd = self.fig.add_axes([0.02, 0.75, 0.10, 0.03])
-        sd.set_facecolor((0.15, 0.15, 0.18))
-        self.sld_d = Slider(sd, 'Docks', 2, 10, valinit=self.num_docks, valstep=1, color=(0.3, 0.6, 0.8))
+        # Control Panel Layout Parameters
+        px = 0.015; pw = 0.21; py = 0.05; ph = 0.90
+        
+        # Bordered Backpanel (Glassmorphism inspired)
+        panel_bg = Rectangle((px, py), pw, ph, facecolor='#1A1C22', edgecolor='#4A4E5A', 
+                             lw=1.2, transform=self.fig.transFigure, zorder=-1, alpha=0.98)
+        self.fig.patches.append(panel_bg)
+        
+        # Panel Title
+        self.fig.text(px + pw/2, py + ph - 0.045, "CONTROL PANEL", color='#F0F0F0', 
+                      va='center', ha='center', fontsize=13, weight='bold')
 
-        sr = self.fig.add_axes([0.02, 0.65, 0.10, 0.03])
-        sr.set_facecolor((0.15, 0.15, 0.18))
-        self.sld_r = Slider(sr, 'Rovers', 1, max(1, self.num_docks//2), valinit=self.num_rovers, valstep=1, color=(0.6, 0.8, 0.3))
+        # Items position
+        item_top = py + ph - 0.12
+        spacing = 0.065
+        item_w = pw - 0.04
+        item_x = px + 0.02
 
-        ap = self.fig.add_axes([0.02, 0.50, 0.10, 0.06])
-        self.btn_play = Button(ap, 'Play', color=(0.15, 0.15, 0.18), hovercolor=(0.25, 0.4, 0.25))
+        # SLIDERS
+        sd_ax = self.fig.add_axes([item_x + 0.07, item_top, item_w - 0.07, 0.025])
+        sd_ax.set_facecolor((0.08, 0.08, 0.1))
+        self.sld_d = Slider(sd_ax, 'Docks', 2, 10, valinit=self.num_docks, valstep=1, 
+                            color='#007AFF', track_color='#2C2C2E')
+        self.sld_d.label.set_color('#EBEBF5')
+        self.sld_d.label.set_fontsize(9)
 
-        b1 = self.fig.add_axes([0.20, 0.04, 0.22, 0.06])
-        self.btn_rerand = Button(b1, "Rerandomize gates")
-        self.btn_rerand.on_clicked(lambda _ : self.reset(self.seed + 1))
+        sr_ax = self.fig.add_axes([item_x + 0.07, item_top - spacing, item_w - 0.07, 0.025])
+        sr_ax.set_facecolor((0.08, 0.08, 0.1))
+        self.sld_r = Slider(sr_ax, 'Rovers', 1, max(1, self.num_docks//2), valinit=self.num_rovers, valstep=1, 
+                            color='#32D74B', track_color='#2C2C2E')
+        self.sld_r.label.set_color('#EBEBF5')
+        self.sld_r.label.set_fontsize(9)
 
-        b2 = self.fig.add_axes([0.46, 0.04, 0.18, 0.06])
-        self.btn_sm = Button(b2, "Smooth: ON" if self.smooth else "Smooth: OFF")
+        # BUTTONS
+        btn_y = item_top - 2.8 * spacing
+        btn_h = 0.05
+        
+        ap = self.fig.add_axes([item_x, btn_y, item_w, btn_h])
+        self.btn_play = Button(ap, 'PLAY SIMULATION', color='#2C2C2E', hovercolor='#3A3A3C')
+        self.btn_play.label.set_color('#FFFFFF')
+        self.btn_play.label.set_weight('bold')
+        self.btn_play.label.set_fontsize(10)
+
+        b1 = self.fig.add_axes([item_x, btn_y - btn_h - 0.02, item_w, btn_h])
+        self.btn_rerand = Button(b1, "RERANDOMIZE GATES", color='#2C2C2E', hovercolor='#3A3A3C')
+        self.btn_rerand.label.set_color('#FFFFFF')
+        self.btn_rerand.label.set_fontsize(10)
+
+        # TOGGLES
+        toggle_y = btn_y - 2.8 * btn_h - 0.03
+        tw = 0.045; th = 0.022
+        
+        sm_ax = self.fig.add_axes([item_x + item_w - tw, toggle_y, tw, th])
+        self.sw_sm = ToggleSwitch(sm_ax, "Smoothing Algorithm", initial_state=self.smooth, 
+                                  on_callback=self.on_smooth)
+        
+        fov_ax = self.fig.add_axes([item_x + item_w - tw, toggle_y - spacing, tw, th])
+        self.sw_fov = ToggleSwitch(fov_ax, "FOV Visualization", initial_state=self.show_fov, 
+                                   on_callback=self.on_fov)
+        
+        tr_ax = self.fig.add_axes([item_x + item_w - tw, toggle_y - 2*spacing, tw, th])
+        self.sw_tr = ToggleSwitch(tr_ax, "Rover Path Trails", initial_state=self.show_trails, 
+                                  on_callback=self.on_trails)
 
         self.sld_d.on_changed(self.on_docks)
         self.sld_r.on_changed(self.on_rovers)
+        self.btn_rerand.on_clicked(lambda _ : self.reset(self.seed + 1))
         self.btn_play.on_clicked(self.on_play)
-        self.btn_sm.on_clicked(self.on_smooth)
         self.fig.canvas.mpl_connect("button_press_event", self.on_click)
+
+        # pause banner + controls HUD
+        self.pause_text = ax.text(0.5, 0.965, "", transform=ax.transAxes,
+                                  ha="center", va="top", fontsize=15,
+                                  color=(1, 1, 1, 0.92),
+                                  bbox=dict(boxstyle="round,pad=0.35", fc=(0, 0, 0, 0.35), ec=(1, 1, 1, 0.18)))
+        self.pause_text.set_visible(False)
+
+        self.hud = ax.text(0.01, 0.01,
+                           "Click: add/remove Human (H) or dispatch Rover   |   Right-click: delete nearest H",
+                           transform=ax.transAxes, ha="left", va="bottom",
+                           fontsize=10, color=(0.95, 0.95, 0.98, 0.65))
+        self.hud.set_clip_on(False)
 
     def clear_art(self):
         for a in self.gate_art:
@@ -1092,6 +1368,19 @@ class Sim:
             try: l.remove()
             except: pass
         self.rover_art = []
+
+        # rover FOV wedges are per-rover patches (remove via rover refs)
+        for r in self.rovers:
+            if r.fov_front is not None:
+                try: r.fov_front.remove()
+                except: pass
+                r.fov_front = None
+            if r.fov_back is not None:
+                try: r.fov_back.remove()
+                except: pass
+                r.fov_back = None
+
+        self._humans_clear_art()
 
     def redraw(self):
         ax = self.ax
@@ -1127,19 +1416,75 @@ class Sim:
             ax.add_patch(poly)
             line, = ax.plot([], [], lw=2.0, alpha=0.55, color=col)
             r.poly, r.line = poly, line
+            r.line.set_visible(self.show_trails)
             r.trail.clear()
             r.trail.append((float(r.state[0]), float(r.state[1])))
             self.rover_art.append((poly, line))
+
+            # FOV wedges (front/back)
+            cam_f, cam_b = self._cam_positions(r)
+            deg_half = HUMAN_FOV_DEG / 2.0
+            theta_f = math.degrees(cam_f[2])
+            theta_b = math.degrees(cam_b[2])
+
+            wf = Wedge((cam_f[0], cam_f[1]), r=HUMAN_RANGE,
+                       theta1=theta_f - deg_half, theta2=theta_f + deg_half,
+                       width=None, facecolor=col, edgecolor=None, alpha=0.12)
+            wb = Wedge((cam_b[0], cam_b[1]), r=HUMAN_RANGE,
+                       theta1=theta_b - deg_half, theta2=theta_b + deg_half,
+                       width=None, facecolor=col, edgecolor=None, alpha=0.12)
+            wf.set_visible(self.show_fov)
+            wb.set_visible(self.show_fov)
+            ax.add_patch(wf); ax.add_patch(wb)
+            r.fov_front = wf
+            r.fov_back = wb
+
+        # humans
+        self._humans_redraw_art()
 
         self.auto = False
         self.btn_play.label.set_text("Play")
         ax.set_title("")
         self.fig.canvas.draw_idle()
 
+    def update_fov_art(self):
+        if not self.rovers:
+            return
+        deg_half = HUMAN_FOV_DEG / 2.0
+        for r in self.rovers:
+            if r.fov_front is None or r.fov_back is None:
+                continue
+            cam_f, cam_b = self._cam_positions(r)
+            theta_f = math.degrees(cam_f[2])
+            theta_b = math.degrees(cam_b[2])
+
+            r.fov_front.set_center((cam_f[0], cam_f[1]))
+            r.fov_front.set_theta1(theta_f - deg_half)
+            r.fov_front.set_theta2(theta_f + deg_half)
+            r.fov_front.set_radius(HUMAN_RANGE)
+            r.fov_front.set_visible(self.show_fov)
+
+            r.fov_back.set_center((cam_b[0], cam_b[1]))
+            r.fov_back.set_theta1(theta_b - deg_half)
+            r.fov_back.set_theta2(theta_b + deg_half)
+            r.fov_back.set_radius(HUMAN_RANGE)
+            r.fov_back.set_visible(self.show_fov)
+
     # ----- events -----
-    def on_smooth(self, _):
-        self.smooth = not self.smooth
-        self.btn_sm.label.set_text("Smooth: ON" if self.smooth else "Smooth: OFF")
+    def on_smooth(self, state):
+        self.smooth = state
+        self.fig.canvas.draw_idle()
+
+    def on_fov(self, state):
+        self.show_fov = state
+        self.update_fov_art()
+        self.fig.canvas.draw_idle()
+
+    def on_trails(self, state):
+        self.show_trails = state
+        for r in self.rovers:
+            if r.line:
+                r.line.set_visible(self.show_trails)
         self.fig.canvas.draw_idle()
 
     def on_docks(self, val):
@@ -1158,8 +1503,8 @@ class Sim:
 
     def on_play(self, _):
         self.auto = not self.auto
-        self.btn_play.label.set_text("Stop" if self.auto else "Play")
-        if self.auto:
+        self.btn_play.label.set_text("STOP SIMULATION" if self.auto else "PLAY SIMULATION")
+        if self.auto and (not self.paused):
             for r in self.rovers:
                 if r.docked and (not r.moving) and r.plan_cd == 0 and r.plan_future is None:
                     nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
@@ -1176,89 +1521,129 @@ class Sim:
     def on_click(self, ev):
         if ev.inaxes != self.ax:
             return
-        if (not self.auto) and any(r.moving for r in self.rovers):
+
+        is_right = (ev.button == 3)
+        if is_right:
+            self.delete_human_at(ev.xdata, ev.ydata)
             return
-        click = np.array([ev.xdata, ev.ydata], float)
-        gi, dist = self.nearest_gate(click)
-        if dist > 1.6 * S:
-            return
-        r = next((rr for rr in self.rovers
-                  if rr.docked and (not rr.moving) and rr.plan_future is None and rr.current_gate != gi), None)
-        if r is None:
-            return
-        self.start_plan_job(r, gi, keep_moving=False)
+
+        if ev.button == 1:
+            # Check if clicking an existing human
+            hi, hd = self._human_nearest(ev.xdata, ev.ydata)
+            if hi >= 0 and hd <= HUMAN_CLICK_TOL:
+                self.humans.pop(hi)
+                self._humans_redraw_art()
+                return
+
+            # Check if clicking a gate for dispatch
+            click = np.array([ev.xdata, ev.ydata], float)
+            gi, g_dist = self.nearest_gate(click)
+            if g_dist <= 1.6 * S:
+                # Dispatch logic
+                if (not self.auto) and any(rr.moving for rr in self.rovers):
+                    return
+                r = next((rr for rr in self.rovers
+                          if rr.docked and (not rr.moving) and rr.plan_future is None and rr.current_gate != gi), None)
+                if r is not None:
+                    self.start_plan_job(r, gi, keep_moving=False)
+                return
+
+            # Otherwise, add a new human
+            self.toggle_human_at(ev.xdata, ev.ydata)
 
     # ----- animation -----
     def animate(self, _):
         self.frame += 1
+        now = time.monotonic()
 
-        for r in self.rovers:
-            if r.plan_cd > 0:
-                r.plan_cd -= 1
-            if r.replan_cd > 0:
-                r.replan_cd -= 1
-            if r.yield_cd > 0:
-                r.yield_cd -= 1
+        # pause logic (human in FOV)
+        self.update_pause_state(now)
 
+        # update pause title
+        if self.paused:
+            title_msg = "HUMAN DETECTED"
+            if self.pause_clear_deadline is not None:
+                rem = max(0.0, self.pause_clear_deadline - now)
+                title_msg = f"RESUMING IN {rem:0.1f}s"
+            self.ax.set_title(title_msg, color='yellow', fontsize=18, weight='bold')
+        else:
+            self.ax.set_title("")
+
+        # allow background plans to complete even while paused (no motion though)
         self.poll_plan_jobs()
 
-        waiting = self.resolve_traffic()
+        # freeze motion + auto scheduling while paused
+        if not self.paused:
+            for r in self.rovers:
+                if r.plan_cd > 0:
+                    r.plan_cd -= 1
+                if r.replan_cd > 0:
+                    r.replan_cd -= 1
+                if r.yield_cd > 0:
+                    r.yield_cd -= 1
 
-        # background replan when truly stuck (async, never blocks others)
-        for r in self.rovers:
-            if not (r.moving and r.path):
-                continue
-            if r.goal_gate >= 0 and r.stuck >= REPLAN_TRIGGER and r.replan_cd == 0 and r.plan_future is None:
-                self.start_plan_job(r, r.goal_gate, keep_moving=True)
-                r.replan_cd = REPLAN_COOLDOWN
+            waiting = self.resolve_traffic()
 
-        # arrivals + autoplan
-        for r in self.rovers:
-            if not (r.moving and r.path):
-                continue
+            # background replan when truly stuck (async, never blocks others)
+            for r in self.rovers:
+                if not (r.moving and r.path):
+                    continue
+                if r.goal_gate >= 0 and r.stuck >= REPLAN_TRIGGER and r.replan_cd == 0 and r.plan_future is None:
+                    self.start_plan_job(r, r.goal_gate, keep_moving=True)
+                    r.replan_cd = REPLAN_COOLDOWN
 
-            if r.idx >= len(r.path) - 1:
-                if self.dock_free(r.goal_gate, r.id):
-                    g = self.gates[r.goal_gate]
-                    r.state = (float(g.dock[0]), float(g.dock[1]), float(g.heading))
-                    r.trail.append((float(r.state[0]), float(r.state[1])))
+            # arrivals + autoplan
+            for r in self.rovers:
+                if not (r.moving and r.path):
+                    continue
 
-                    r.previous_gate, r.current_gate = r.current_gate, r.goal_gate
-                    r.goal_gate = -1
-                    r.path = None
-                    r.moving = False
-                    r.docked = True
-                    r.stuck = 0
-                    r.reversing = False
-                    r.force_step = 0
-                    r.yield_cd = 0
+                if r.idx >= len(r.path) - 1:
+                    if self.dock_free(r.goal_gate, r.id):
+                        g = self.gates[r.goal_gate]
+                        r.state = (float(g.dock[0]), float(g.dock[1]), float(g.heading))
+                        r.trail.append((float(r.state[0]), float(r.state[1])))
 
-                    if self.auto and r.plan_cd == 0 and r.plan_future is None:
+                        r.previous_gate, r.current_gate = r.current_gate, r.goal_gate
+                        r.goal_gate = -1
+                        r.path = None
+                        r.moving = False
+                        r.docked = True
+                        r.stuck = 0
+                        r.reversing = False
+                        r.force_step = 0
+                        r.yield_cd = 0
+
+                        if self.auto and r.plan_cd == 0 and r.plan_future is None:
+                            nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
+                            if nxt >= 0 and (not self.start_plan_job(r, nxt, keep_moving=False)):
+                                r.plan_cd = 30
+                    else:
+                        r.goal_gate = -1
+                        r.path = None
+                        r.moving = False
+                        r.reversing = False
+                        r.force_step = 0
+
+            if self.auto:
+                for r in self.rovers:
+                    if r.docked and (not r.moving) and r.goal_gate == -1 and r.plan_cd == 0 and r.plan_future is None:
                         nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
                         if nxt >= 0 and (not self.start_plan_job(r, nxt, keep_moving=False)):
                             r.plan_cd = 30
-                else:
-                    r.goal_gate = -1
-                    r.path = None
-                    r.moving = False
-                    r.reversing = False
-                    r.force_step = 0
 
-        if self.auto:
-            for r in self.rovers:
-                if r.docked and (not r.moving) and r.goal_gate == -1 and r.plan_cd == 0 and r.plan_future is None:
-                    nxt = self.furthest_dock(r.current_gate, r.previous_gate, r.id)
-                    if nxt >= 0 and (not self.start_plan_job(r, nxt, keep_moving=False)):
-                        r.plan_cd = 30
-
-        # draw
+        # draw rovers + trails + FOV
         for r in self.rovers:
             if r.poly:
                 r.poly.set_xy(square_corners((r.state[0], r.state[1]), r.state[2], S))
-            if r.line and (self.frame % TRAIL_DRAW_EVERY == 0) and len(r.trail) > 1:
-                xs, ys = zip(*r.trail)
-                r.line.set_data(xs, ys)
+            if r.line and self.show_trails:
+                lx = [p[0] for p in r.trail]
+                ly = [p[1] for p in r.trail]
+                r.line.set_data(lx, ly)
+                r.line.set_visible(True)
+            elif r.line:
+                r.line.set_visible(False)
 
+        self.update_fov_art()
         return []
 
     def run(self):
